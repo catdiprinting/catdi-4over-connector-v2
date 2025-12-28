@@ -102,3 +102,13 @@ class FourOverClient:
                 "auth_header": "present" if "Authorization" in headers else None,
             },
         }
+    def whoami(self) -> Dict[str, Any]:
+        return self.request("GET", "/whoami")
+
+    def list_products(self, limit: int = 300) -> Dict[str, Any]:
+        """
+        Best-effort endpoint. If 4over uses a different path in your account,
+        we can adjust once you show me the response body / docs excerpt.
+        """
+        # Common guess: /products
+        return self.request("GET", "/products", params={"limit": limit})

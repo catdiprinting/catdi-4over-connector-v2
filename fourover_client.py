@@ -1,4 +1,3 @@
-# fourover_client.py
 import hashlib
 import hmac
 import os
@@ -8,19 +7,21 @@ import requests
 
 
 def _clean_secret(value: str) -> str:
-    # Removes invisible copy/paste junk that breaks signatures
+    # Removes invisible copy/paste junk (spaces/newlines) that breaks signatures
     return (value or "").strip()
 
 
 def fourover_signature(private_key: str, http_method: str) -> str:
     """
-    4over signature (per their docs):
+    4over signature (per their docs / examples):
       key = sha256(private_key).hexdigest()
       signature = hmac_sha256(key, HTTP_METHOD).hexdigest()
+
+    Notes:
+    - HTTP_METHOD must be "GET", "POST", etc. (not a URL path)
+    - We use the hex digest of sha256(private_key) as the HMAC key bytes (utf-8)
     """
     pk = _clean_secret(private_key).encode("utf-8")
-
-    # sha256(private_key) -> hex digest string
     pk_hash_hex = hashlib.sha256(pk).hexdigest().encode("utf-8")
 
     msg = http_method.upper().encode("utf-8")
@@ -61,12 +62,12 @@ class FourOverClient:
         params_out = dict(params or {})
         headers: Dict[str, str] = {}
 
-        # ✅ IMPORTANT: 4over GET/DELETE expects apikey + signature in QUERY
+        # GET/DELETE -> signature in QUERY
         if method in ("GET", "DELETE"):
             params_out["apikey"] = self.apikey
             params_out["signature"] = sig
         else:
-            # ✅ For POST/PUT/PATCH, docs show Authorization header
+            # POST/PUT/PATCH -> Authorization header
             headers["Authorization"] = f"API {self.apikey}:{sig}"
 
         r = requests.request(
@@ -78,11 +79,17 @@ class FourOverClient:
             timeout=self.timeout,
         )
 
-        # Try JSON, fallback to text
         try:
             payload = r.json()
         except Exception:
             payload = {"raw": r.text}
+
+        # Safe debug: do NOT leak full signature
+        safe_sig = f"{sig[:6]}...{sig[-6:]} (len={len(sig)})"
+
+        dbg_query = dict(params_out)
+        if "signature" in dbg_query:
+            dbg_query["signature"] = safe_sig
 
         return {
             "http_status": r.status_code,
@@ -91,11 +98,7 @@ class FourOverClient:
             "debug": {
                 "url": url,
                 "method": method,
-                # Safe debug: show that signature exists without leaking it
-                "query": {
-                    **({k: v for k, v in params_out.items() if k != "signature"}),
-                    "signature": f"{sig[:6]}...{sig[-6:]} (len={len(sig)})" if "signature" in params_out else None,
-                },
+                "query": dbg_query,
                 "auth_header": "present" if "Authorization" in headers else None,
             },
         }

@@ -5,6 +5,9 @@ from fourover_client import call_4over
 
 app = FastAPI(title="Catdi 4over Connector", version="0.0.3")
 
+@app.get("/fingerprint")
+def fingerprint():
+    return {"fingerprint": "ROOT_MAIN_PY_V1", "file": __file__}
 
 @app.get("/")
 def root():

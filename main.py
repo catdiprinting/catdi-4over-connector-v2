@@ -42,8 +42,5 @@ async def fourover_ping():
 
 @app.get("/4over/whoami")
 async def fourover_whoami():
-    """
-    Primary auth test endpoint.
-    """
-    result, debug = await call_4over("/whoami")
+    result, debug = await call_4over_probe("/whoami")
     return {"result": result, "debug": debug}

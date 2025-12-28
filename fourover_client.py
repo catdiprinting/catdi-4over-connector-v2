@@ -15,125 +15,157 @@ class FourOverConfig:
     private_key: str
 
 
-def _get_fourover_config() -> FourOverConfig:
+def _cfg() -> FourOverConfig:
     base_url = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
     apikey = os.getenv("FOUR_OVER_APIKEY")
     private_key = os.getenv("FOUR_OVER_PRIVATE_KEY")
 
     if not apikey:
-        raise RuntimeError("FOUR_OVER_APIKEY is not set")
+        raise RuntimeError("FOUR_OVER_APIKEY is not set (set this on the CONNECTOR service)")
     if not private_key:
-        raise RuntimeError("FOUR_OVER_PRIVATE_KEY is not set")
+        raise RuntimeError("FOUR_OVER_PRIVATE_KEY is not set (set this on the CONNECTOR service)")
 
     return FourOverConfig(base_url=base_url, apikey=apikey, private_key=private_key)
 
 
-def _canonical_path_and_query(path: str, query: Dict[str, Any]) -> str:
+def _sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _hmac_sha256_hex(key: bytes, msg: bytes) -> str:
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def _sorted_qs(params: Dict[str, Any]) -> str:
+    return urlencode(sorted((k, str(v)) for k, v in params.items()))
+
+
+def _candidate_canonicals(method: str, path: str, qs_no_sig: str, host: str) -> Dict[str, str]:
     """
-    4over debug in your past logs showed canonical like:
-      /whoami?apikey=catdi
-    We'll build query in stable sorted order.
+    Try a handful of canonical forms that APIs commonly use.
     """
-    # Always include apikey in query (some endpoints require it in query)
-    items = sorted((k, str(v)) for k, v in query.items())
-    qs = urlencode(items)
-    return f"{path}?{qs}" if qs else path
+    # path must start with /
+    if not path.startswith("/"):
+        path = "/" + path
+
+    candidates = {
+        # what we already tried
+        "path+qs": f"{path}?{qs_no_sig}" if qs_no_sig else path,
+        # no leading slash
+        "noslash_path+qs": f"{path.lstrip('/')}?{qs_no_sig}" if qs_no_sig else path.lstrip("/"),
+        # method included
+        "method\\npath+qs": f"{method.upper()}\n{path}?{qs_no_sig}" if qs_no_sig else f"{method.upper()}\n{path}",
+        # method + path only (no qs)
+        "method\\npath": f"{method.upper()}\n{path}",
+        # host included
+        "host+path+qs": f"{host}{path}?{qs_no_sig}" if qs_no_sig else f"{host}{path}",
+        # full URL
+        "full_url": f"https://{host}{path}?{qs_no_sig}" if qs_no_sig else f"https://{host}{path}",
+    }
+    return candidates
 
 
-def _sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _sign_variants(canonical: str, private_key: str) -> Dict[str, str]:
-    """
-    Try a few common signature strategies:
-    - sha256(private_key + canonical)
-    - sha256(canonical + private_key)
-    - hmac_sha256(private_key, canonical)
-
-    We'll send one at a time so you can see which (if any) works.
-    """
+def _signature_methods(private_key: str, canonical: str) -> Dict[str, str]:
     pk = private_key.encode("utf-8")
     can = canonical.encode("utf-8")
 
     return {
-        "sha256_pk_plus_can": _sha256_hex(pk + can),
-        "sha256_can_plus_pk": _sha256_hex(can + pk),
-        "hmac_sha256_pk": hmac.new(pk, can, hashlib.sha256).hexdigest(),
+        "sha256(pk+can)": _sha256_hex(pk + can),
+        "sha256(can+pk)": _sha256_hex(can + pk),
+        "hmac(pk,can)": _hmac_sha256_hex(pk, can),
+        # sometimes key must be sha256(key) first
+        "hmac(sha256(pk),can)": _hmac_sha256_hex(hashlib.sha256(pk).digest(), can),
     }
 
 
-async def call_4over(
+async def call_4over_probe(
     path: str,
+    method: str = "GET",
     extra_query: Optional[Dict[str, Any]] = None,
     timeout_s: float = 30.0,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Calls a 4over endpoint with apikey + signature in querystring (based on your earlier debug logs).
-    Returns: (result_json_or_error, debug_info)
+    Probes multiple canonical + signature + placement strategies.
+    Returns (result, debug) where result includes ok:false on failure.
     """
-    cfg = _get_fourover_config()
+    cfg = _cfg()
 
+    # Base query (no signature)
     query = {"apikey": cfg.apikey}
     if extra_query:
         query.update(extra_query)
 
-    canonical = _canonical_path_and_query(path, query)
-    signatures = _sign_variants(canonical, cfg.private_key)
+    qs_no_sig = _sorted_qs(query)
+    host = cfg.base_url.replace("https://", "").replace("http://", "").split("/")[0]
 
-    # Try each signature variant until one works
-    last_error: Optional[Dict[str, Any]] = None
+    canonicals = _candidate_canonicals(method=method, path=path, qs_no_sig=qs_no_sig, host=host)
 
     async with httpx.AsyncClient(base_url=cfg.base_url, timeout=timeout_s) as client:
-        for method_name, sig in signatures.items():
-            query_with_sig = dict(query)
-            query_with_sig["signature"] = sig
+        last_error: Dict[str, Any] = {}
 
-            url = f"{path}?{urlencode(sorted((k, str(v)) for k, v in query_with_sig.items()))}"
+        for canon_name, canonical in canonicals.items():
+            sigs = _signature_methods(cfg.private_key, canonical)
 
-            try:
-                resp = await client.get(url)
-                content_type = resp.headers.get("content-type", "")
+            for sig_name, sig in sigs.items():
+                # Strategy A: signature in query string (what you were originally doing)
+                q1 = dict(query)
+                q1["signature"] = sig
+                url_q = f"{path}?{_sorted_qs(q1)}"
 
-                # attempt json, fallback to text
-                if "application/json" in content_type.lower():
-                    data = resp.json()
-                else:
-                    data = {"raw": resp.text}
-
-                # 2xx = success; some APIs return ok:false inside 200
-                if 200 <= resp.status_code < 300:
-                    return data, {
-                        "base_url": cfg.base_url,
-                        "path": path,
-                        "canonical": canonical,
-                        "signature_method": method_name,
-                        "http_status": resp.status_code,
-                    }
-
-                last_error = {
-                    "http_status": resp.status_code,
-                    "data": data,
-                    "signature_method": method_name,
-                    "canonical": canonical,
-                }
-            except Exception as e:
-                last_error = {
-                    "exception": f"{type(e).__name__}: {e}",
-                    "signature_method": method_name,
-                    "canonical": canonical,
+                # Strategy B: signature in headers (common alternate pattern)
+                headers = {
+                    "X-APIKEY": cfg.apikey,
+                    "X-SIGNATURE": sig,
                 }
 
-    return (
-        {
+                # Try both placements
+                for placement, req in [
+                    ("query", {"url": url_q, "headers": {}}),
+                    ("headers", {"url": f"{path}?{qs_no_sig}" if qs_no_sig else path, "headers": headers}),
+                ]:
+                    try:
+                        resp = await client.request(method.upper(), req["url"], headers=req["headers"])
+                        ct = (resp.headers.get("content-type") or "").lower()
+                        data = resp.json() if "application/json" in ct else {"raw": resp.text}
+
+                        if 200 <= resp.status_code < 300 and not (isinstance(data, dict) and data.get("status") == "error"):
+                            return data, {
+                                "base_url": cfg.base_url,
+                                "path": path,
+                                "method": method.upper(),
+                                "canonical_used": canonical,
+                                "canonical_variant": canon_name,
+                                "signature_variant": sig_name,
+                                "placement": placement,
+                                "http_status": resp.status_code,
+                            }
+
+                        last_error = {
+                            "http_status": resp.status_code,
+                            "data": data,
+                            "canonical_variant": canon_name,
+                            "signature_variant": sig_name,
+                            "placement": placement,
+                            "canonical_used": canonical,
+                        }
+                    except Exception as e:
+                        last_error = {
+                            "exception": f"{type(e).__name__}: {e}",
+                            "canonical_variant": canon_name,
+                            "signature_variant": sig_name,
+                            "placement": placement,
+                            "canonical_used": canonical,
+                        }
+
+        return {
             "ok": False,
-            "message": "All signature variants failed",
+            "message": "Probe failed: no canonical/signature/placement combo succeeded",
             "last_error": last_error,
-        },
-        {
+        }, {
             "base_url": cfg.base_url,
             "path": path,
-            "canonical": canonical,
-            "attempted_methods": list(signatures.keys()),
-        },
-    )
+            "method": method.upper(),
+            "attempted_canonicals": list(canonicals.keys()),
+            "attempted_signature_variants": ["sha256(pk+can)", "sha256(can+pk)", "hmac(pk,can)", "hmac(sha256(pk),can)"],
+            "attempted_placements": ["query", "headers"],
+        }

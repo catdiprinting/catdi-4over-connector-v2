@@ -1,56 +1,28 @@
 from fastapi import FastAPI
 from typing import Dict, Any
 import os
-import psycopg2
 
-from fourover_client import FourOverClient
-
-# -----------------------------------------------------------------------------
-# App
-# -----------------------------------------------------------------------------
-
-app = FastAPI(
-    title="Catdi 4over Connector",
-    version="0.6",
-)
-
-# -----------------------------------------------------------------------------
-# Root / Health
-# -----------------------------------------------------------------------------
+app = FastAPI(title="Catdi 4over Connector", version="0.6")
 
 @app.get("/")
 def root():
-    return {
-        "service": "catdi-4over-connector",
-        "status": "running",
-    }
-
+    return {"service": "catdi-4over-connector", "status": "running"}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
 @app.get("/version")
 def version():
-    return {
-        "service": "catdi-4over-connector",
-        "phase": "0.6",
-        "build": "4over-ping-enabled",
-    }
-
+    return {"service": "catdi-4over-connector", "phase": "0.6", "build": "4over-ping-enabled"}
 
 @app.get("/fingerprint")
 def fingerprint():
-    return {
-        "fingerprint": "ROOT_MAIN_PY_V1",
-        "file": "/app/main.py",
-    }
+    return {"fingerprint": "ROOT_MAIN_PY_V1", "file": "/app/main.py"}
 
-# -----------------------------------------------------------------------------
-# Database (lazy / safe)
-# -----------------------------------------------------------------------------
-
+# -------------------------
+# DB CHECK (lazy import)
+# -------------------------
 @app.get("/db-check")
 def db_check() -> Dict[str, Any]:
     db_url = os.getenv("DATABASE_URL")
@@ -58,6 +30,7 @@ def db_check() -> Dict[str, Any]:
         return {"db": "missing DATABASE_URL"}
 
     try:
+        import psycopg2  # lazy import so missing psycopg2 won't crash app boot
         conn = psycopg2.connect(db_url)
         cur = conn.cursor()
         cur.execute("SELECT 1;")
@@ -66,29 +39,30 @@ def db_check() -> Dict[str, Any]:
         conn.close()
         return {"db": "ok"}
     except Exception as e:
-        return {
-            "db": "error",
-            "error": str(e),
-        }
+        return {"db": "error", "error": str(e)}
 
-# -----------------------------------------------------------------------------
-# 4over – AUTH TEST
-# -----------------------------------------------------------------------------
-
+# -------------------------
+# 4OVER WHOAMI (safe import)
+# -------------------------
 @app.get("/4over/whoami")
 def fourover_whoami():
-    """
-    Ping 4over authentication.
-    This MUST include apikey + signature in QUERY (GET request).
-    """
-    client = FourOverClient()
-    return client.request("GET", "/whoami")
+    try:
+        from fourover_client import FourOverClient  # safe import
+    except Exception as e:
+        return {
+            "http_status": 500,
+            "ok": False,
+            "data": {"message": "Failed to import FourOverClient. Check fourover_client.py exists at root."},
+            "debug": {"import_error": str(e)},
+        }
 
-# -----------------------------------------------------------------------------
-# Future endpoints will live below (locked for now)
-# -----------------------------------------------------------------------------
-# /4over/categories
-# /4over/products
-# /explorer/business-cards
-# /pricing/preview
-# -----------------------------------------------------------------------------
+    try:
+        client = FourOverClient()
+        return client.request("GET", "/whoami")
+    except Exception as e:
+        return {
+            "http_status": 500,
+            "ok": False,
+            "data": {"message": "Exception during 4over request"},
+            "debug": {"error": str(e)},
+        }

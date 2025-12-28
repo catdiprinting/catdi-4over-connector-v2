@@ -39,8 +39,10 @@ async def fourover_ping():
     result, debug = await call_4over("/whoami")
     return {"result": result, "debug": debug}
 
-
 @app.get("/4over/whoami")
 async def fourover_whoami():
-    result, debug = await call_4over_probe("/whoami")
-    return {"result": result, "debug": debug}
+    try:
+        from fourover_client import call_4over
+        return await call_4over("/whoami")
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}

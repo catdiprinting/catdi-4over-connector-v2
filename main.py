@@ -66,3 +66,17 @@ def fourover_whoami():
             "data": {"message": "Exception during 4over request"},
             "debug": {"error": str(e)},
         }
+@app.get("/4over/printproducts/categories")
+def fourover_categories(max: int = 1000, offset: int = 0):
+    client = FourOverClient()
+    return client.request("GET", "/printproducts/categories", params={"max": max, "offset": offset})
+
+
+@app.get("/4over/printproducts/categories/{category_uuid}/products")
+def fourover_category_products(category_uuid: str, max: int = 1000, offset: int = 0):
+    client = FourOverClient()
+    return client.request(
+        "GET",
+        f"/printproducts/categories/{category_uuid}/products",
+        params={"max": max, "offset": offset},
+    )

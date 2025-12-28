@@ -27,17 +27,21 @@ async def global_exception_handler(request, exc: Exception):
 def root():
     return {"service": "catdi-4over-connector", "status": "running"}
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.get("/version")
 def version():
     return {"service": "catdi-4over-connector", "phase": "0.7", "build": "4over-auth-locked"}
 
+
 @app.get("/fingerprint")
 def fingerprint():
     return {"fingerprint": "ROOT_MAIN_PY_V2", "file": "/app/main.py"}
+
 
 # -----------------------------------------------------------------------------
 # DB CHECK (lazy import)
@@ -60,16 +64,22 @@ def db_check() -> Dict[str, Any]:
     except Exception as e:
         return {"db": "error", "error": str(e)}
 
+
 # -----------------------------------------------------------------------------
 # 4over helpers (safe import)
 # -----------------------------------------------------------------------------
 def _get_client():
+    """
+    Always returns a tuple:
+      (client, None) on success
+      (None, "error string") on failure
+    """
     try:
         from fourover_client import FourOverClient
-        return FourOverClient()
+        return FourOverClient(), None
     except Exception as e:
-        # Never crash the app just because imports/env are off
         return None, str(e)
+
 
 # -----------------------------------------------------------------------------
 # 4over – AUTH TEST
@@ -88,7 +98,13 @@ def fourover_whoami():
     try:
         return client.request("GET", "/whoami")
     except Exception as e:
-        return {"ok": False, "http_status": 500, "data": {"message": "Exception during whoami"}, "debug": {"error": str(e)}}
+        return {
+            "ok": False,
+            "http_status": 500,
+            "data": {"message": "Exception during whoami"},
+            "debug": {"error": str(e)},
+        }
+
 
 # -----------------------------------------------------------------------------
 # 4over – CATALOG EXPLORER
@@ -105,7 +121,6 @@ def fourover_categories(max: int = 1000, offset: int = 0):
         }
 
     try:
-        # NOTE: endpoint path per 4over docs + Sham email: /printproducts/categories
         return client.request("GET", "/printproducts/categories", params={"max": max, "offset": offset})
     except Exception as e:
         return {
@@ -114,6 +129,7 @@ def fourover_categories(max: int = 1000, offset: int = 0):
             "data": {"message": "Exception during categories call"},
             "debug": {"error": str(e), "max": max, "offset": offset},
         }
+
 
 @app.get("/4over/printproducts/categories/{category_uuid}/products")
 def fourover_category_products(category_uuid: str, max: int = 1000, offset: int = 0):

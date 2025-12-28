@@ -1,88 +1,101 @@
-"""
-fourover_client.py
-------------------
-Minimal, crash-proof 4over client.
-
-GOALS:
-- Never crash the FastAPI app at import time
-- Centralize all 4over HTTP calls here
-- Make auth debugging explicit and visible
-"""
-
-from __future__ import annotations
-
+# fourover_client.py
+import hashlib
+import hmac
 import os
 from typing import Any, Dict, Optional
 
-import httpx
+import requests
 
 
-# ========== CONFIG ==========
-FOUR_OVER_BASE_URL = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
-FOUR_OVER_APIKEY = os.getenv("FOUR_OVER_APIKEY")
-FOUR_OVER_PRIVATE_KEY = os.getenv("FOUR_OVER_PRIVATE_KEY")
+def _clean_secret(value: str) -> str:
+    # Removes invisible copy/paste junk that breaks signatures
+    return (value or "").strip()
 
 
-def _assert_env() -> None:
-    """Fail fast but cleanly if env vars are missing."""
-    if not FOUR_OVER_APIKEY:
-        raise RuntimeError("FOUR_OVER_APIKEY is not set")
-    if not FOUR_OVER_PRIVATE_KEY:
-        raise RuntimeError("FOUR_OVER_PRIVATE_KEY is not set")
-
-
-# ========== PUBLIC API ==========
-async def call_4over(
-    path: str,
-    *,
-    method: str = "GET",
-    query: Optional[Dict[str, Any]] = None,
-    json: Optional[Dict[str, Any]] = None,
-    timeout: float = 30.0,
-) -> Dict[str, Any]:
+def fourover_signature(private_key: str, http_method: str) -> str:
     """
-    Generic 4over API caller.
-
-    NOTE:
-    - This currently sends ONLY the apikey (no signature yet)
-    - Expected to return 401 until auth is finalized
-    - Designed so the app never crashes
+    4over signature (per their docs):
+      key = sha256(private_key).hexdigest()
+      signature = hmac_sha256(key, HTTP_METHOD).hexdigest()
     """
+    pk = _clean_secret(private_key).encode("utf-8")
 
-    _assert_env()
+    # sha256(private_key) -> hex digest string
+    pk_hash_hex = hashlib.sha256(pk).hexdigest().encode("utf-8")
 
-    method = method.upper()
-    path = "/" + path.lstrip("/")
+    msg = http_method.upper().encode("utf-8")
+    return hmac.new(pk_hash_hex, msg, hashlib.sha256).hexdigest()
 
-    params: Dict[str, Any] = {"apikey": FOUR_OVER_APIKEY}
-    if query:
-        params.update(query)
 
-    url = f"{FOUR_OVER_BASE_URL}{path}"
+class FourOverClient:
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        apikey: Optional[str] = None,
+        private_key: Optional[str] = None,
+        timeout: int = 30,
+    ) -> None:
+        self.base_url = (base_url or os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").rstrip("/")
+        self.apikey = _clean_secret(apikey or os.getenv("FOUR_OVER_APIKEY") or "")
+        self.private_key = _clean_secret(private_key or os.getenv("FOUR_OVER_PRIVATE_KEY") or "")
+        self.timeout = timeout
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.request(
+        if not self.apikey:
+            raise ValueError("FOUR_OVER_APIKEY is missing")
+        if not self.private_key:
+            raise ValueError("FOUR_OVER_PRIVATE_KEY is missing")
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        json: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        method = method.upper()
+        path = "/" + path.lstrip("/")
+        url = f"{self.base_url}{path}"
+
+        sig = fourover_signature(self.private_key, method)
+
+        params_out = dict(params or {})
+        headers: Dict[str, str] = {}
+
+        # ✅ IMPORTANT: 4over GET/DELETE expects apikey + signature in QUERY
+        if method in ("GET", "DELETE"):
+            params_out["apikey"] = self.apikey
+            params_out["signature"] = sig
+        else:
+            # ✅ For POST/PUT/PATCH, docs show Authorization header
+            headers["Authorization"] = f"API {self.apikey}:{sig}"
+
+        r = requests.request(
             method=method,
             url=url,
-            params=params,
+            params=params_out,
             json=json,
-            headers={"Accept": "application/json"},
+            headers=headers,
+            timeout=self.timeout,
         )
 
-        content_type = resp.headers.get("content-type", "").lower()
-
+        # Try JSON, fallback to text
         try:
-            data = resp.json() if "application/json" in content_type else {"raw": resp.text}
+            payload = r.json()
         except Exception:
-            data = {"raw": resp.text}
+            payload = {"raw": r.text}
 
         return {
-            "http_status": resp.status_code,
-            "ok": 200 <= resp.status_code < 300,
-            "data": data,
+            "http_status": r.status_code,
+            "ok": r.ok,
+            "data": payload,
             "debug": {
                 "url": url,
                 "method": method,
-                "query": params,
+                # Safe debug: show that signature exists without leaking it
+                "query": {
+                    **({k: v for k, v in params_out.items() if k != "signature"}),
+                    "signature": f"{sig[:6]}...{sig[-6:]} (len={len(sig)})" if "signature" in params_out else None,
+                },
+                "auth_header": "present" if "Authorization" in headers else None,
             },
         }

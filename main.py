@@ -1,17 +1,29 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from typing import Dict, Any
+import os
+import psycopg2
 
-from db import ping_db
-from fourover_client import call_4over
+from fourover_client import FourOverClient
 
-app = FastAPI(title="Catdi 4over Connector", version="0.0.3")
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
 
-@app.get("/fingerprint")
-def fingerprint():
-    return {"fingerprint": "ROOT_MAIN_PY_V1", "file": __file__}
+app = FastAPI(
+    title="Catdi 4over Connector",
+    version="0.6",
+)
+
+# -----------------------------------------------------------------------------
+# Root / Health
+# -----------------------------------------------------------------------------
 
 @app.get("/")
 def root():
-    return {"ok": True, "hint": "try /health, /version, /db-check, /4over/whoami, /docs"}
+    return {
+        "service": "catdi-4over-connector",
+        "status": "running",
+    }
 
 
 @app.get("/health")
@@ -21,31 +33,62 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"service": "catdi-4over-connector", "phase": "0.6", "build": "4over-ping-enabled"}
+    return {
+        "service": "catdi-4over-connector",
+        "phase": "0.6",
+        "build": "4over-ping-enabled",
+    }
 
+
+@app.get("/fingerprint")
+def fingerprint():
+    return {
+        "fingerprint": "ROOT_MAIN_PY_V1",
+        "file": "/app/main.py",
+    }
+
+# -----------------------------------------------------------------------------
+# Database (lazy / safe)
+# -----------------------------------------------------------------------------
 
 @app.get("/db-check")
-def db_check():
+def db_check() -> Dict[str, Any]:
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        return {"db": "missing DATABASE_URL"}
+
     try:
-        ping_db()
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        cur.fetchone()
+        cur.close()
+        conn.close()
         return {"db": "ok"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB check failed: {type(e).__name__}: {e}")
+        return {
+            "db": "error",
+            "error": str(e),
+        }
 
-
-@app.get("/4over/ping")
-async def fourover_ping():
-    """
-    Simple reachability test. Uses /whoami because it's the classic auth test,
-    but you can swap to any lightweight endpoint you know exists.
-    """
-    result, debug = await call_4over("/whoami")
-    return {"result": result, "debug": debug}
+# -----------------------------------------------------------------------------
+# 4over – AUTH TEST
+# -----------------------------------------------------------------------------
 
 @app.get("/4over/whoami")
-async def fourover_whoami():
-    try:
-        from fourover_client import call_4over
-        return await call_4over("/whoami")
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+def fourover_whoami():
+    """
+    Ping 4over authentication.
+    This MUST include apikey + signature in QUERY (GET request).
+    """
+    client = FourOverClient()
+    return client.request("GET", "/whoami")
+
+# -----------------------------------------------------------------------------
+# Future endpoints will live below (locked for now)
+# -----------------------------------------------------------------------------
+# /4over/categories
+# /4over/products
+# /explorer/business-cards
+# /pricing/preview
+# -----------------------------------------------------------------------------

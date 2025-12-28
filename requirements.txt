@@ -1,4 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
+sqlalchemy
 requests
 psycopg2-binary

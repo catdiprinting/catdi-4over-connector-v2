@@ -1,25 +1,24 @@
 import os
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-def _clean_env(v: str | None) -> str | None:
-    if v is None:
-        return None
-    # Strip whitespace + accidental newlines from Railway UI copy/paste
-    return v.strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-DATABASE_URL = _clean_env(os.getenv("DATABASE_URL")) or "sqlite:///./local.db"
-
-# SQLAlchemy expects postgresql:// not postgres://
+# Railway sometimes provides postgres:// which SQLAlchemy wants as postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+is_sqlite = DATABASE_URL.startswith("sqlite")
+
 engine = create_engine(
     DATABASE_URL,
+    connect_args={"check_same_thread": False} if is_sqlite else {},
     pool_pre_ping=True,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()

@@ -1,15 +1,15 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Depends
 from sqlalchemy import text
-from db import engine
+from sqlalchemy.orm import Session
+from db import engine, get_db, DATABASE_URL
 from models import Base
 from fourover_client import FourOverClient
 from routes_catalog import router as catalog_router
 import os
 
-app = FastAPI(title="catdi-4over-connector", version="0.9.0")
+app = FastAPI(title="Catdi × 4over Connector", version="0.9.0")
 
-# Create tables on boot
+# Create tables on startup
 Base.metadata.create_all(bind=engine)
 
 @app.get("/")
@@ -23,50 +23,42 @@ def version():
 @app.get("/routes")
 def routes():
     out = []
-    for r in app.router.routes:
-        if hasattr(r, "path"):
-            out.append(r.path)
-    return sorted(set(out))
+    for r in app.routes:
+        if getattr(r, "methods", None):
+            out.append({"path": r.path, "methods": sorted(list(r.methods))})
+    return {"ok": True, "routes": out}
 
 @app.get("/health")
 def health():
     return {"ok": True, "service": "catdi-4over-connector"}
 
 @app.get("/health/db")
-def health_db():
+def health_db(db: Session = Depends(get_db)):
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        # show host (mask creds)
-        db_url = (os.getenv("DATABASE_URL") or "").strip()
-        return {"ok": True, "db": "ok", "db_host": db_url.split("@")[-1] if "@" in db_url else db_url}
+        db.execute(text("SELECT 1"))
+        return {"ok": True, "db": "ok", "db_host": DATABASE_URL.split("@")[-1]}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "db": "failed", "error": str(e)})
+        return {"ok": False, "db": "failed", "error": str(e)}
+
+@app.get("/debug/env")
+def debug_env():
+    # DO NOT leak secrets; only show which keys are present
+    keys = [
+        "DATABASE_URL",
+        "FOUR_OVER_APIKEY", "FOUR_OVER_API_KEY", "FOUROVER_APIKEY", "FOUROVER_API_KEY",
+        "FOUR_OVER_PRIVATE_KEY", "FOUROVER_PRIVATE_KEY",
+        "FOUR_OVER_BASE_URL", "FOUROVER_BASE_URL",
+    ]
+    present = {}
+    for k in keys:
+        v = os.getenv(k)
+        present[k] = bool(v and v.strip())
+    return {"ok": True, "present": present}
 
 @app.get("/4over/whoami")
-def whoami():
-    """
-    Quick auth test.
-    """
-    try:
-        client = FourOverClient()
-        data = client.whoami()
-        return {"ok": True, "data": data}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-@app.get("/4over/explore-path")
-def explore_path(path: str, offset: int = 0, perPage: int = 20):
-    """
-    Generic explorer with pagination.
-    Example: /4over/explore-path?path=/products&offset=0&perPage=20
-    """
-    try:
-        client = FourOverClient()
-        data = client.explore_path(path, offset=offset, per_page=perPage)
-        return {"ok": True, "path": path, "offset": offset, "perPage": perPage, "data": data}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+def debug_whoami():
+    client = FourOverClient()
+    return client.whoami()
 
 # Catalog routes
 app.include_router(catalog_router)

@@ -1,51 +1,28 @@
-import json
-
-
-def extract_items(payload: dict) -> list[dict]:
+def extract_fields(item: dict) -> dict:
     """
-    4over productsfeed payload typically includes:
-      - items: [...]
-      - totalResults: N
-    We'll handle either:
-      payload["items"] OR payload["data"]["items"]
+    Best-effort extraction for indexing/search.
+    We still store raw_json for everything.
     """
-    if isinstance(payload, dict):
-        if "items" in payload and isinstance(payload["items"], list):
-            return payload["items"]
-        if "data" in payload and isinstance(payload["data"], dict) and isinstance(payload["data"].get("items"), list):
-            return payload["data"]["items"]
-    return []
+    name = item.get("name") or item.get("title") or item.get("product_name")
+    sku = item.get("sku") or item.get("code") or item.get("product_code")
+    category = None
+    status = item.get("status") or item.get("state")
 
+    # common patterns
+    if isinstance(item.get("category"), dict):
+        category = item["category"].get("name") or item["category"].get("title")
+    elif isinstance(item.get("category"), str):
+        category = item.get("category")
 
-def extract_total_results(payload: dict) -> int | None:
-    """
-    tries payload["totalResults"] or payload["data"]["totalResults"]
-    """
-    if isinstance(payload, dict):
-        tr = payload.get("totalResults")
-        if isinstance(tr, int):
-            return tr
-        if "data" in payload and isinstance(payload["data"], dict):
-            tr2 = payload["data"].get("totalResults")
-            if isinstance(tr2, int):
-                return tr2
-    return None
+    if not category:
+        # sometimes nested
+        cat = item.get("printproduct_category") or item.get("printproductCategory")
+        if isinstance(cat, dict):
+            category = cat.get("name") or cat.get("title")
 
-
-def get_item_uuid(item: dict) -> str | None:
-    """
-    Productsfeed items tend to include uuid keys like:
-      - id
-      - uuid
-      - product_uuid
-    We'll try a few.
-    """
-    for k in ("id", "uuid", "product_uuid", "productUuid"):
-        v = item.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-
-def serialize_item(item: dict) -> str:
-    return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+    return {
+        "name": name,
+        "sku": sku,
+        "category": category,
+        "status": status,
+    }

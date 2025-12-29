@@ -1,170 +1,111 @@
-from sqlalchemy.orm import Session
-from models import ProductFeedItem
+import json
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from db import SessionLocal
+from models import CatalogItem
 from fourover_client import FourOverClient
-from catalog_parser import extract_items, extract_total_results, get_item_uuid, serialize_item
+from catalog_parser import extract_fields
 
 
-def upsert_productsfeed_items(db: Session, items: list[dict]) -> dict:
-    created = 0
-    updated = 0
-    skipped = 0
+def upsert_catalog_item(db, item_id: str, payload: dict):
+    fields = extract_fields(payload)
 
-    for item in items:
-        uuid = get_item_uuid(item)
-        if not uuid:
-            skipped += 1
-            continue
+    existing = db.execute(select(CatalogItem).where(CatalogItem.item_id == item_id)).scalar_one_or_none()
+    raw_json = json.dumps(payload, ensure_ascii=False)
 
-        raw = serialize_item(item)
+    if existing:
+        existing.name = fields["name"]
+        existing.sku = fields["sku"]
+        existing.category = fields["category"]
+        existing.status = fields["status"]
+        existing.raw_json = raw_json
+        return "updated"
+    else:
+        row = CatalogItem(
+            item_id=item_id,
+            name=fields["name"],
+            sku=fields["sku"],
+            category=fields["category"],
+            status=fields["status"],
+            raw_json=raw_json,
+        )
+        db.add(row)
+        return "inserted"
 
-        existing = db.query(ProductFeedItem).filter(ProductFeedItem.product_uuid == uuid).one_or_none()
-        if existing:
-            if existing.raw_json != raw:
-                existing.raw_json = raw
-                updated += 1
-        else:
-            db.add(ProductFeedItem(product_uuid=uuid, raw_json=raw))
-            created += 1
 
-    db.commit()
-    return {"created": created, "updated": updated, "skipped": skipped}
-
-
-def sync_productsfeed(
-    client: FourOverClient,
-    db: Session,
-    start_offset: int = 0,
-    per_page_requested: int = 200,
-    limit_pages: int = 10,
-) -> dict:
+def sync_catalog(max_pages: int = 5, start_offset: int = 0, perPage: int = 200):
     """
-    Pull N pages from productsfeed and upsert into DB.
-    Uses enforced page size from returned item count.
+    perPage will be capped by 4over (you observed 20).
+    Logic: offset += enforced_page_size until done or max_pages reached.
     """
-    offset = max(0, int(start_offset))
-    pages = max(1, int(limit_pages))
+    client = FourOverClient()
+    db = SessionLocal()
 
-    total_results = None
-    enforced_page_size = None
+    try:
+        offset = start_offset
+        inserted = 0
+        updated = 0
+        total_results = None
+        enforced_page_size = None
 
-    total_created = 0
-    total_updated = 0
-    total_skipped = 0
-    total_pulled = 0
+        pages_done = 0
 
-    last_first_ids = []
-    last_last_ids = []
+        while True:
+            if max_pages is not None and pages_done >= max_pages:
+                break
 
-    for page_i in range(pages):
-        payload = client.get_productsfeed(offset=offset, per_page=per_page_requested)
-        items = extract_items(payload)
+            page = client.list_printproducts(offset=offset, perPage=perPage)
 
-        if total_results is None:
-            total_results = extract_total_results(payload)
+            # 4over response patterns vary; handle common ones:
+            data = page.get("data") or page
+            items = data.get("items") or data.get("results") or data.get("data") or []
+            meta = data.get("meta") or data.get("paging") or data.get("pagination") or {}
 
-        page_count = len(items)
-        if enforced_page_size is None:
-            enforced_page_size = page_count if page_count > 0 else 20  # fallback
+            # try to infer totals + page size
+            if total_results is None:
+                total_results = meta.get("totalResults") or meta.get("total") or data.get("totalResults") or data.get("total")
 
-        # capture sample ids for sanity
-        ids = []
-        for it in items:
-            uid = get_item_uuid(it)
-            if uid:
-                ids.append(uid)
+            if enforced_page_size is None:
+                enforced_page_size = meta.get("perPage") or meta.get("pageSize") or len(items) or 20
 
-        if page_i == 0:
-            last_first_ids = ids[:10]
-        last_last_ids = ids[-10:] if len(ids) >= 10 else ids
+            if not items:
+                break
 
-        res = upsert_productsfeed_items(db, items)
-        total_created += res["created"]
-        total_updated += res["updated"]
-        total_skipped += res["skipped"]
-        total_pulled += page_count
+            # Each item may be summary; use item["id"] then fetch full detail
+            for it in items:
+                item_id = it.get("id") or it.get("uuid") or it.get("printproduct_id")
+                if not item_id:
+                    continue
 
-        offset += enforced_page_size
+                full = client.get_printproduct(item_id)
 
-        # stop if we hit the end
-        if total_results is not None and offset >= total_results:
-            break
+                verdict = upsert_catalog_item(db, item_id=item_id, payload=full)
+                if verdict == "inserted":
+                    inserted += 1
+                else:
+                    updated += 1
 
-        # stop if API returns empty
-        if page_count == 0:
-            break
+            db.commit()
 
-    return {
-        "ok": True,
-        "requested_pages": pages,
-        "start_offset": start_offset,
-        "perPage_requested": per_page_requested,
-        "enforced_page_size": enforced_page_size,
-        "pulled_items": total_pulled,
-        "items_created": total_created,
-        "items_updated": total_updated,
-        "items_skipped_no_uuid": total_skipped,
-        "end_offset": offset,
-        "totalResults": total_results,
-        "sample_first_10_ids": last_first_ids,
-        "sample_last_10_ids": last_last_ids,
-    }
+            pages_done += 1
+            offset += int(enforced_page_size)
 
+            if total_results is not None and offset >= int(total_results):
+                break
 
-def paging_test_productsfeed(
-    client: FourOverClient,
-    pages: int = 5,
-    per_page_requested: int = 200,
-    start_offset: int = 0,
-) -> dict:
-    offset = max(0, int(start_offset))
-    pages = max(1, int(pages))
+        return {
+            "ok": True,
+            "inserted": inserted,
+            "updated": updated,
+            "pages_done": pages_done,
+            "end_offset": offset,
+            "totalResults": total_results,
+            "page_size_assumed": enforced_page_size,
+        }
 
-    total_results = None
-    enforced_page_size = None
-    pulled_items = 0
-
-    sample_first_10 = []
-    sample_last_10 = []
-
-    for page_i in range(pages):
-        payload = client.get_productsfeed(offset=offset, per_page=per_page_requested)
-        items = extract_items(payload)
-        if total_results is None:
-            total_results = extract_total_results(payload)
-
-        page_count = len(items)
-        pulled_items += page_count
-
-        if enforced_page_size is None:
-            enforced_page_size = page_count if page_count > 0 else 20
-
-        ids = []
-        for it in items:
-            uid = get_item_uuid(it)
-            if uid:
-                ids.append(uid)
-
-        if page_i == 0:
-            sample_first_10 = ids[:10]
-        sample_last_10 = ids[-10:] if len(ids) >= 10 else ids
-
-        offset += enforced_page_size
-
-        if total_results is not None and offset >= total_results:
-            break
-
-        if page_count == 0:
-            break
-
-    return {
-        "ok": True,
-        "requested_pages": pages,
-        "start_offset": start_offset,
-        "page_size_assumed": enforced_page_size,
-        "pulled_items": pulled_items,
-        "end_offset": offset,
-        "totalResults": total_results,
-        "sample_first_10_ids": sample_first_10,
-        "sample_last_10_ids": sample_last_10,
-        "verdict": "Looks good if pulled_items == pages*page_size_assumed (unless near end) and IDs change.",
-    }
+    except IntegrityError:
+        db.rollback()
+        raise
+    finally:
+        db.close()

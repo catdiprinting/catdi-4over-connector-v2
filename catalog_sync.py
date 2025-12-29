@@ -1,91 +1,92 @@
 from sqlalchemy.orm import Session
-from sqlalchemy import select
-from models import CatalogItem
 from fourover_client import FourOverClient
-import catalog_parser
+from models import CatalogItem
+from catalog_parser import extract_catalog_fields
 
-def pull_catalog_page(offset: int = 0, per_page_requested: int = 200) -> dict:
+def pull_products_page(offset: int, per_page_requested: int = 200) -> dict:
+    """
+    Pull one page from /products. You observed the API caps perPage to 20.
+    """
     client = FourOverClient()
-    payload = client.get_printproducts(offset=offset, per_page=per_page_requested)
+    return client.explore_path("/products", offset=offset, per_page=per_page_requested)
 
-    items = catalog_parser.extract_items(payload)
-    enforced_page_size = len(items)
-
-    # Try to find "total" in common spots
-    total = None
-    for k in ("totalResults", "total", "total_results", "count"):
-        if isinstance(payload.get(k), int):
-            total = payload.get(k)
-            break
-    if total is None and isinstance(payload.get("paging"), dict) and isinstance(payload["paging"].get("total"), int):
-        total = payload["paging"]["total"]
-
-    return {
-        "offset": offset,
-        "requested_perPage": per_page_requested,
-        "enforced_page_size": enforced_page_size,
-        "totalResults": total,
-        "items": items,
-    }
-
-def upsert_items(db: Session, items: list[dict]) -> dict:
-    inserted = 0
-    updated = 0
-    skipped = 0
+def upsert_items(db: Session, items: list[dict]) -> int:
+    inserted_or_updated = 0
 
     for it in items:
-        fid = catalog_parser.item_id(it)
-        if not fid:
-            skipped += 1
+        fields = extract_catalog_fields(it)
+        pu = fields.get("product_uuid")
+        if not pu:
             continue
 
-        name = catalog_parser.item_name(it)
-        raw = catalog_parser.to_raw_json(it)
-
-        existing = db.execute(
-            select(CatalogItem).where(CatalogItem.fourover_id == fid)
-        ).scalar_one_or_none()
-
+        existing = db.query(CatalogItem).filter(CatalogItem.product_uuid == pu).one_or_none()
         if existing:
-            existing.name = name
-            existing.raw_json = raw
-            updated += 1
+            # update
+            existing.group_id = fields["group_id"]
+            existing.group_name = fields["group_name"]
+            existing.size_id = fields["size_id"]
+            existing.size_name = fields["size_name"]
+            existing.stock_id = fields["stock_id"]
+            existing.stock_name = fields["stock_name"]
+            existing.coating_id = fields["coating_id"]
+            existing.coating_name = fields["coating_name"]
+            existing.raw_json = fields["raw_json"]
         else:
-            db.add(CatalogItem(fourover_id=fid, name=name, raw_json=raw))
-            inserted += 1
+            db.add(CatalogItem(**fields))
+        inserted_or_updated += 1
 
     db.commit()
-    return {"inserted": inserted, "updated": updated, "skipped": skipped}
+    return inserted_or_updated
 
-def sync_catalog(db: Session, pages: int = 1, start_offset: int = 0, per_page_requested: int = 200) -> dict:
+def sync_products(db: Session, pages: int = 1, start_offset: int = 0, per_page_requested: int = 200) -> dict:
+    """
+    Safe incremental sync: pulls `pages` pages, each page uses offset += enforced_page_size.
+    """
     offset = start_offset
-    pulled_total = 0
-    last_page_size = None
+    total_pulled = 0
+    total_written = 0
+    enforced_page_size = None
     total_results = None
 
     for _ in range(pages):
-        page = pull_catalog_page(offset=offset, per_page_requested=per_page_requested)
-        items = page["items"]
-        last_page_size = page["enforced_page_size"]
-        total_results = page["totalResults"]
+        payload = pull_products_page(offset=offset, per_page_requested=per_page_requested)
 
-        pulled_total += len(items)
-        result = upsert_items(db, items)
+        # Typical shape: { items: [...], totalResults: N, offset: X, perPage: 20 } (varies)
+        items = payload.get("items") or payload.get("data") or []
+        if isinstance(items, dict) and "items" in items:
+            items = items["items"]
 
-        # move forward by the actual enforced page size
-        offset += (last_page_size or 0)
+        if total_results is None:
+            total_results = payload.get("totalResults") or payload.get("total") or None
 
-        # If nothing came back, stop early
-        if last_page_size == 0:
+        # infer enforced page size
+        if enforced_page_size is None:
+            enforced_page_size = payload.get("perPage") or payload.get("pageSize") or len(items) or 20
+
+        pulled = len(items)
+        total_pulled += pulled
+
+        written = upsert_items(db, items)
+        total_written += written
+
+        # move forward
+        offset += int(enforced_page_size or 20)
+
+        # stop if we reached the end
+        if total_results is not None and offset >= int(total_results):
+            break
+
+        # stop if API returned nothing (safety)
+        if pulled == 0:
             break
 
     return {
         "ok": True,
-        "pages_requested": pages,
         "start_offset": start_offset,
         "end_offset": offset,
-        "pulled_items": pulled_total,
-        "last_page_size": last_page_size,
+        "pages": pages,
+        "enforced_page_size": enforced_page_size,
+        "pulled_items": total_pulled,
+        "written_items": total_written,
         "totalResults": total_results,
-        "db": "updated",
     }

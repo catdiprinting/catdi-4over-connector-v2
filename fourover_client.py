@@ -72,3 +72,22 @@ class FourOverClient:
                 "query": {**query, "signature": f"{sig[:6]}...{sig[-6:]}"},
             },
         }
+# --- ADD THIS AT THE BOTTOM OF fourover_client.py ---
+
+import os
+
+def get_client_from_env():
+    """
+    Standardized factory used by main.py.
+    Reuses the existing FourOverClient implementation.
+    """
+    api_key = os.getenv("FOUROVER_APIKEY") or os.getenv("FOUR_OVER_APIKEY")
+    private_key = os.getenv("FOUROVER_PRIVATE_KEY") or os.getenv("FOUR_OVER_PRIVATE_KEY")
+
+    if not api_key or not private_key:
+        raise RuntimeError("Missing 4over credentials in env vars")
+
+    return FourOverClient(
+        apikey=api_key,
+        private_key=private_key,
+    )

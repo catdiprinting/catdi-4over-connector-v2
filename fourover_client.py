@@ -8,23 +8,17 @@ import requests
 
 
 def _clean_secret(value: str) -> str:
-    # Removes invisible copy/paste junk (spaces/newlines) that breaks signatures
     return (value or "").strip()
 
 
 def fourover_signature(private_key: str, http_method: str) -> str:
     """
-    4over signature (per their docs / examples):
+    4over signature:
       key = sha256(private_key).hexdigest()
       signature = hmac_sha256(key, HTTP_METHOD).hexdigest()
-
-    Notes:
-    - HTTP_METHOD must be "GET", "POST", etc. (not a URL path)
-    - We use the hex digest of sha256(private_key) as the HMAC key bytes (utf-8)
     """
     pk = _clean_secret(private_key).encode("utf-8")
     pk_hash_hex = hashlib.sha256(pk).hexdigest().encode("utf-8")
-
     msg = http_method.upper().encode("utf-8")
     return hmac.new(pk_hash_hex, msg, hashlib.sha256).hexdigest()
 
@@ -35,7 +29,7 @@ class FourOverClient:
         base_url: Optional[str] = None,
         apikey: Optional[str] = None,
         private_key: Optional[str] = None,
-        timeout: int = 30,
+        timeout: int = 60,
     ) -> None:
         self.base_url = (base_url or os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").rstrip("/")
         self.apikey = _clean_secret(apikey or os.getenv("FOUR_OVER_APIKEY") or "")
@@ -68,7 +62,6 @@ class FourOverClient:
             params_out["apikey"] = self.apikey
             params_out["signature"] = sig
         else:
-            # POST/PUT/PATCH -> Authorization header
             headers["Authorization"] = f"API {self.apikey}:{sig}"
 
         r = requests.request(
@@ -85,9 +78,7 @@ class FourOverClient:
         except Exception:
             payload = {"raw": r.text}
 
-        # Safe debug: do NOT leak full signature
         safe_sig = f"{sig[:6]}...{sig[-6:]} (len={len(sig)})"
-
         dbg_query = dict(params_out)
         if "signature" in dbg_query:
             dbg_query["signature"] = safe_sig

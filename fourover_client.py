@@ -1,93 +1,76 @@
-import hashlib
-import hmac
 import os
+import hmac
+import hashlib
 import requests
-from typing import Dict, Any, Optional
+from urllib.parse import urlencode
 
-def _clean(value: str) -> str:
-    return (value or "").strip()
-
-def fourover_signature(private_key: str, method: str) -> str:
-    pk = _clean(private_key).encode("utf-8")
-    key = hashlib.sha256(pk).hexdigest().encode("utf-8")
-    msg = method.upper().encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 class FourOverClient:
-    def __init__(
-        self,
-        base_url: Optional[str] = None,
-        apikey: Optional[str] = None,
-        private_key: Optional[str] = None,
-        timeout: int = 30,
-    ):
-        self.base_url = (base_url or os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com")).rstrip("/")
-        self.apikey = _clean(apikey or os.getenv("FOUR_OVER_APIKEY"))
-        self.private_key = _clean(private_key or os.getenv("FOUR_OVER_PRIVATE_KEY"))
+    """
+    Minimal 4over API client using apikey + signature auth.
+    Signature = HMAC-SHA256(private_key, canonical_path_with_query)
+    """
+
+    def __init__(self, apikey: str, private_key: str, base_url: str = "https://api.4over.com", timeout: int = 60):
+        self.apikey = apikey
+        self.private_key = private_key
+        self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-        if not self.apikey or not self.private_key:
-            raise ValueError("4over API credentials missing")
+    def _sign(self, canonical: str) -> str:
+        mac = hmac.new(self.private_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256)
+        return mac.hexdigest()
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        params: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        method = method.upper()
-        path = "/" + path.lstrip("/")
+    def request(self, method: str, path: str, params: dict | None = None) -> dict:
+        """
+        path must start with /, e.g. /printproducts/productsfeed
+        params are query params for the endpoint (offset, perPage, etc.)
+        """
+        if not path.startswith("/"):
+            raise ValueError("path must start with '/'")
+
+        params = params or {}
+
+        # canonical query WITHOUT apikey/signature first
+        qs = urlencode(params, doseq=True)
+        canonical = f"{path}?{qs}" if qs else path
+
+        signature = self._sign(canonical)
+
+        # actual query includes apikey + signature
+        full_params = dict(params)
+        full_params["apikey"] = self.apikey
+        full_params["signature"] = signature
+
         url = f"{self.base_url}{path}"
+        resp = requests.request(method.upper(), url, params=full_params, timeout=self.timeout)
 
-        sig = fourover_signature(self.private_key, method)
-        query = dict(params or {})
-
-        headers = {}
-        if method in ("GET", "DELETE"):
-            query["apikey"] = self.apikey
-            query["signature"] = sig
-        else:
-            headers["Authorization"] = f"API {self.apikey}:{sig}"
-
-        r = requests.request(
-            method=method,
-            url=url,
-            params=query,
-            headers=headers,
-            timeout=self.timeout,
-        )
-
+        # 4over often returns JSON even on errors
         try:
-            payload = r.json()
+            data = resp.json()
         except Exception:
-            payload = {"raw": r.text}
+            data = {"raw": resp.text}
 
-        return {
-            "http_status": r.status_code,
-            "ok": r.ok,
-            "data": payload,
-            "debug": {
-                "url": url,
-                "method": method,
-                "query": {**query, "signature": f"{sig[:6]}...{sig[-6:]}"},
-            },
-        }
-# --- ADD THIS AT THE BOTTOM OF fourover_client.py ---
+        if resp.status_code >= 400:
+            raise RuntimeError(f"4over API error {resp.status_code}: {data}")
 
-import os
+        return data
 
-def get_client_from_env():
+    def get_productsfeed(self, offset: int = 0, per_page: int = 200) -> dict:
+        # NOTE: server may cap perPage; we detect the real count from returned items length.
+        return self.request("GET", "/printproducts/productsfeed", params={"offset": offset, "perPage": per_page})
+
+
+def get_client_from_env() -> FourOverClient:
     """
-    Standardized factory used by main.py.
-    Reuses the existing FourOverClient implementation.
+    Standard factory used by the app.
+    Supports either env var naming.
     """
     api_key = os.getenv("FOUROVER_APIKEY") or os.getenv("FOUR_OVER_APIKEY")
     private_key = os.getenv("FOUROVER_PRIVATE_KEY") or os.getenv("FOUR_OVER_PRIVATE_KEY")
+    base_url = os.getenv("FOUROVER_BASE_URL", "https://api.4over.com")
 
     if not api_key or not private_key:
-        raise RuntimeError("Missing 4over credentials in env vars")
+        raise RuntimeError("Missing env vars: FOUROVER_APIKEY and FOUROVER_PRIVATE_KEY (or FOUR_OVER_*)")
 
-    return FourOverClient(
-        apikey=api_key,
-        private_key=private_key,
-    )
+    return FourOverClient(apikey=api_key, private_key=private_key, base_url=base_url)

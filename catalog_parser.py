@@ -1,28 +1,32 @@
-def extract_fields(item: dict) -> dict:
+import json
+
+def extract_items(payload: dict) -> list[dict]:
     """
-    Best-effort extraction for indexing/search.
-    We still store raw_json for everything.
+    4over /printproducts response typically has:
+      payload["data"] = list of products
+    but we guard for variations.
     """
-    name = item.get("name") or item.get("title") or item.get("product_name")
-    sku = item.get("sku") or item.get("code") or item.get("product_code")
-    category = None
-    status = item.get("status") or item.get("state")
+    if not isinstance(payload, dict):
+        return []
 
-    # common patterns
-    if isinstance(item.get("category"), dict):
-        category = item["category"].get("name") or item["category"].get("title")
-    elif isinstance(item.get("category"), str):
-        category = item.get("category")
+    if "data" in payload and isinstance(payload["data"], list):
+        return payload["data"]
 
-    if not category:
-        # sometimes nested
-        cat = item.get("printproduct_category") or item.get("printproductCategory")
-        if isinstance(cat, dict):
-            category = cat.get("name") or cat.get("title")
+    # Sometimes APIs return "items"
+    if "items" in payload and isinstance(payload["items"], list):
+        return payload["items"]
 
-    return {
-        "name": name,
-        "sku": sku,
-        "category": category,
-        "status": status,
-    }
+    return []
+
+def item_id(item: dict) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    return item.get("id") or item.get("uuid") or item.get("product_id")
+
+def item_name(item: dict) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    return item.get("name") or item.get("title")
+
+def to_raw_json(item: dict) -> str:
+    return json.dumps(item, ensure_ascii=False)

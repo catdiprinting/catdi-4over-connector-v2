@@ -207,3 +207,67 @@ def productsfeed_search_smart(
         "top_category_names_in_sample": cat_counter.most_common(15),
         "note": "If hits=0, use top_category_names_in_sample to identify correct terminology, then search those terms."
     }
+@app.get("/4over/printproducts/productsfeed/paging-test")
+def productsfeed_paging_test(
+    lastupdate: str | None = None,
+    time: str | None = None,
+):
+    """
+    Definitive paging test:
+    - Fetch page 0 and page 1 using offset
+    - Detect enforced page size
+    - Confirm offset increments correctly
+    """
+    client = get_client()
+    params = _delta_params(lastupdate, time)
+
+    # Page 0
+    p0 = dict(params)
+    p0["offset"] = 0
+    p0["perPage"] = 200  # intentionally high to test cap
+
+    r0 = client.request("GET", "/printproducts/productsfeed", params=p0)
+    data0 = r0.get("data", {})
+    items0 = _normalize_list(data0)
+
+    # Page 1 (offset += returned count)
+    enforced_page_size = len(items0)
+    p1 = dict(params)
+    p1["offset"] = enforced_page_size
+    p1["perPage"] = 200
+
+    r1 = client.request("GET", "/printproducts/productsfeed", params=p1)
+    data1 = r1.get("data", {})
+    items1 = _normalize_list(data1)
+
+    return {
+        "ok": True,
+        "observations": {
+            "requested_perPage": 200,
+            "enforced_page_size": enforced_page_size,
+            "totalResults": data0.get("totalResults"),
+            "currentPage_page0": data0.get("currentPage"),
+            "currentPage_page1": data1.get("currentPage"),
+        },
+        "page0": {
+            "offset": 0,
+            "items_count": len(items0),
+            "first_ids": [
+                i.get("product_uuid") or i.get("uuid") or i.get("id")
+                for i in items0[:5]
+            ],
+        },
+        "page1": {
+            "offset": enforced_page_size,
+            "items_count": len(items1),
+            "first_ids": [
+                i.get("product_uuid") or i.get("uuid") or i.get("id")
+                for i in items1[:5]
+            ],
+        },
+        "paging_verdict": {
+            "page_size_capped": enforced_page_size < 200,
+            "offset_moves_forward": items0[:1] != items1[:1],
+            "use_this_logic": "offset += enforced_page_size until offset >= totalResults"
+        }
+    }

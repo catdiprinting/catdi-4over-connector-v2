@@ -1,92 +1,108 @@
 from sqlalchemy.orm import Session
+from models import CatalogProduct
 from fourover_client import FourOverClient
-from models import CatalogItem
-from catalog_parser import extract_catalog_fields
+from catalog_parser import parse_product_row
 
-def pull_products_page(offset: int, per_page_requested: int = 200) -> dict:
+def pull_catalog_page(offset: int, per_page_requested: int = 200) -> dict:
     """
-    Pull one page from /products. You observed the API caps perPage to 20.
+    Pull a page from /products.
+    4over may cap perPage (often 20). We'll detect the actual size by len(items).
     """
     client = FourOverClient()
-    return client.explore_path("/products", offset=offset, per_page=per_page_requested)
+    payload = client.products(offset=offset, per_page=per_page_requested)
 
-def upsert_items(db: Session, items: list[dict]) -> int:
-    inserted_or_updated = 0
+    # Common shapes: payload["items"], payload["data"], etc.
+    items = payload.get("items") or payload.get("data") or payload.get("results") or []
+    total = payload.get("totalResults") or payload.get("total") or payload.get("count") or None
 
-    for it in items:
-        fields = extract_catalog_fields(it)
-        pu = fields.get("product_uuid")
-        if not pu:
+    return {
+        "offset": offset,
+        "requested_perPage": per_page_requested,
+        "items": items,
+        "items_count": len(items),
+        "totalResults": total,
+        "raw": payload,
+    }
+
+def upsert_products(db: Session, items: list[dict]) -> int:
+    n = 0
+    for row in items:
+        parsed = parse_product_row(row)
+        if not parsed.get("id"):
             continue
 
-        existing = db.query(CatalogItem).filter(CatalogItem.product_uuid == pu).one_or_none()
+        existing = db.get(CatalogProduct, parsed["id"])
         if existing:
-            # update
-            existing.group_id = fields["group_id"]
-            existing.group_name = fields["group_name"]
-            existing.size_id = fields["size_id"]
-            existing.size_name = fields["size_name"]
-            existing.stock_id = fields["stock_id"]
-            existing.stock_name = fields["stock_name"]
-            existing.coating_id = fields["coating_id"]
-            existing.coating_name = fields["coating_name"]
-            existing.raw_json = fields["raw_json"]
+            existing.groupid = parsed["groupid"]
+            existing.groupname = parsed["groupname"]
+            existing.sizeid = parsed["sizeid"]
+            existing.sizename = parsed["sizename"]
+            existing.stockid = parsed["stockid"]
+            existing.stockname = parsed["stockname"]
+            existing.coatingid = parsed["coatingid"]
+            existing.coatingname = parsed["coatingname"]
+            existing.raw_json = parsed["raw_json"]
         else:
-            db.add(CatalogItem(**fields))
-        inserted_or_updated += 1
+            db.add(CatalogProduct(**parsed))
+        n += 1
+    return n
 
-    db.commit()
-    return inserted_or_updated
-
-def sync_products(db: Session, pages: int = 1, start_offset: int = 0, per_page_requested: int = 200) -> dict:
+def sync_catalog(db: Session, pages: int = 1, start_offset: int = 0) -> dict:
     """
-    Safe incremental sync: pulls `pages` pages, each page uses offset += enforced_page_size.
+    Pull N pages starting at offset, inserting/upserting into DB.
+    Offset advances by the enforced page size we observe (len(items)).
     """
+    pulled = 0
     offset = start_offset
-    total_pulled = 0
-    total_written = 0
     enforced_page_size = None
     total_results = None
 
-    for _ in range(pages):
-        payload = pull_products_page(offset=offset, per_page_requested=per_page_requested)
+    sample_first_ids = []
+    sample_last_ids = []
 
-        # Typical shape: { items: [...], totalResults: N, offset: X, perPage: 20 } (varies)
-        items = payload.get("items") or payload.get("data") or []
-        if isinstance(items, dict) and "items" in items:
-            items = items["items"]
+    for i in range(pages):
+        page = pull_catalog_page(offset=offset, per_page_requested=200)
+        items = page["items"]
+        total_results = page["totalResults"] if page["totalResults"] is not None else total_results
 
-        if total_results is None:
-            total_results = payload.get("totalResults") or payload.get("total") or None
-
-        # infer enforced page size
         if enforced_page_size is None:
-            enforced_page_size = payload.get("perPage") or payload.get("pageSize") or len(items) or 20
+            enforced_page_size = page["items_count"] or 0
 
-        pulled = len(items)
-        total_pulled += pulled
+        if items:
+            ids = []
+            for x in items:
+                pid = x.get("id") or x.get("productid") or x.get("uuid")
+                if pid:
+                    ids.append(str(pid))
 
-        written = upsert_items(db, items)
-        total_written += written
+            if i == 0:
+                sample_first_ids = ids[:10]
+            sample_last_ids = ids[-10:]
 
-        # move forward
-        offset += int(enforced_page_size or 20)
+        # Write to DB
+        upserted = upsert_products(db, items)
+        db.commit()
 
-        # stop if we reached the end
-        if total_results is not None and offset >= int(total_results):
+        pulled += upserted
+
+        # Advance offset by enforced count
+        step = page["items_count"] or enforced_page_size or 0
+        if step <= 0:
             break
+        offset += step
 
-        # stop if API returned nothing (safety)
-        if pulled == 0:
+        # Stop if we're at the end
+        if total_results is not None and offset >= int(total_results):
             break
 
     return {
         "ok": True,
+        "requested_pages": pages,
         "start_offset": start_offset,
+        "page_size_assumed": enforced_page_size,
+        "pulled_items": pulled,
         "end_offset": offset,
-        "pages": pages,
-        "enforced_page_size": enforced_page_size,
-        "pulled_items": total_pulled,
-        "written_items": total_written,
         "totalResults": total_results,
+        "sample_first_10_ids": sample_first_ids,
+        "sample_last_10_ids": sample_last_ids,
     }

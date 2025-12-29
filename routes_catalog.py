@@ -1,42 +1,41 @@
-# routes_catalog.py
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from db import get_db, CatalogSize, CatalogLine, CatalogProduct
+from db import get_db
+import catalog_sync
 
 router = APIRouter(prefix="/catalog", tags=["catalog"])
 
-@router.get("/sizes")
-def sizes(db: Session = Depends(get_db)):
-    rows = db.query(CatalogSize).order_by(CatalogSize.display.asc()).all()
-    return [{"id": r.id, "display": r.display} for r in rows]
+@router.get("/sync/dryrun")
+def sync_dryrun(
+    pages: int = Query(1, ge=1, le=50),
+    start_offset: int = Query(0, ge=0),
+):
+    # just prove pagination works without DB writes
+    # (still hits 4over)
+    payload = catalog_sync.pull_products_page(offset=start_offset, per_page_requested=200)
+    items = payload.get("items") or payload.get("data") or []
+    if isinstance(items, dict) and "items" in items:
+        items = items["items"]
 
-@router.get("/lines")
-def lines(size_id: int, family: str = "Business Cards", db: Session = Depends(get_db)):
-    # All lines that exist for that family + size
-    q = (
-        db.query(CatalogLine.id, CatalogLine.name)
-        .join(CatalogProduct, CatalogProduct.line_id == CatalogLine.id)
-        .filter(CatalogProduct.size_id == size_id)
-        .filter(CatalogLine.family == family)
-        .distinct()
-        .order_by(CatalogLine.name.asc())
+    return {
+        "ok": True,
+        "start_offset": start_offset,
+        "requested_pages": pages,
+        "sample_count_this_page": len(items),
+        "sample_first_5_ids": [it.get("id") for it in items[:5]],
+        "payload_keys": sorted(list(payload.keys())),
+    }
+
+@router.post("/sync")
+def sync_into_db(
+    pages: int = Query(1, ge=1, le=500),
+    start_offset: int = Query(0, ge=0),
+    per_page_requested: int = Query(200, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    return catalog_sync.sync_products(
+        db=db,
+        pages=pages,
+        start_offset=start_offset,
+        per_page_requested=per_page_requested,
     )
-    return [{"id": row.id, "name": row.name} for row in q.all()]
-
-@router.get("/resolve")
-def resolve(size_id: int, line_id: int, db: Session = Depends(get_db)):
-    # Returns the actual 4over product(s) behind the selection
-    products = (
-        db.query(CatalogProduct)
-        .filter(CatalogProduct.size_id == size_id, CatalogProduct.line_id == line_id)
-        .order_by(CatalogProduct.product_code.asc())
-        .all()
-    )
-    if not products:
-        raise HTTPException(status_code=404, detail="No products for selection")
-
-    return [{
-        "product_uuid": p.product_uuid,
-        "product_code": p.product_code,
-        "description": p.description,
-    } for p in products]

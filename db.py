@@ -1,22 +1,18 @@
 import os
 from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = (os.getenv("DATABASE_URL") or "sqlite:///./local.db").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-# Normalize old-style Railway URLs if they ever appear
+# CRITICAL: remove hidden whitespace/newlines (you hit railway\n already)
+DATABASE_URL = DATABASE_URL.strip()
+
+# Railway sometimes provides postgres://
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# If user sets postgresql:// without driver, force psycopg v3 driver
-if DATABASE_URL.startswith("postgresql://"):
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
-
-connect_args = {}
-if DATABASE_URL.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
-elif DATABASE_URL.startswith("postgresql+psycopg://"):
-    connect_args = {"sslmode": "require"}
+# No sqlite connect_args unless sqlite
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
 engine = create_engine(
     DATABASE_URL,
@@ -25,4 +21,3 @@ engine = create_engine(
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()

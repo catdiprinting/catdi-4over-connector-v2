@@ -1,89 +1,82 @@
-from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func
-import traceback
-
+from sqlalchemy import select
 from models import CatalogItem
+from fourover_client import FourOverClient
+import catalog_parser
 
-PAGE_SIZE_ASSUMED = 20  # API enforces 20 even if perPage requested is higher
+def pull_catalog_page(offset: int = 0, per_page_requested: int = 200) -> dict:
+    client = FourOverClient()
+    payload = client.get_printproducts(offset=offset, per_page=per_page_requested)
 
+    items = catalog_parser.extract_items(payload)
+    enforced_page_size = len(items)
 
-def get_catalog_count(db: Session) -> int:
-    return db.execute(select(func.count()).select_from(CatalogItem)).scalar_one()
+    # Try to find "total" in common spots
+    total = None
+    for k in ("totalResults", "total", "total_results", "count"):
+        if isinstance(payload.get(k), int):
+            total = payload.get(k)
+            break
+    if total is None and isinstance(payload.get("paging"), dict) and isinstance(payload["paging"].get("total"), int):
+        total = payload["paging"]["total"]
 
+    return {
+        "offset": offset,
+        "requested_perPage": per_page_requested,
+        "enforced_page_size": enforced_page_size,
+        "totalResults": total,
+        "items": items,
+    }
 
-def upsert_ids(db: Session, ids: List[str]) -> int:
-    upserted = 0
-    for _id in ids:
-        existing = db.get(CatalogItem, _id)
-        if existing:
-            continue
-        db.add(CatalogItem(id=_id, raw_json=None))
-        upserted += 1
-    db.commit()
-    return upserted
+def upsert_items(db: Session, items: list[dict]) -> dict:
+    inserted = 0
+    updated = 0
+    skipped = 0
 
-
-def pull_catalog_page(offset: int, per_page_requested: int = 200) -> Dict[str, Any]:
-    """
-    Calls your existing fourover_client.py lazily so app boot doesn't crash.
-    """
-    try:
-        from fourover_client import FourOverClient  # MUST exist
-    except Exception as e:
-        raise RuntimeError(
-            "Failed importing fourover_client.FourOverClient. "
-            "Your fourover_client.py may have a syntax/import/env issue."
-        ) from e
-
-    try:
-        client = FourOverClient()
-    except Exception as e:
-        raise RuntimeError(
-            "FourOverClient() failed to initialize. "
-            "Likely missing env vars (API key/secret) or constructor crash."
-        ) from e
-
-    # IMPORTANT: adjust this method name if your client uses something else
-    try:
-        return client.get_catalog(offset=offset, per_page=per_page_requested)
-    except Exception as e:
-        raise RuntimeError(
-            "client.get_catalog() failed. This is inside your fourover_client call. "
-            "Check method name + request auth + response parsing."
-        ) from e
-
-
-def extract_ids(payload: Dict[str, Any]) -> List[str]:
-    items = payload.get("items") or payload.get("data") or []
-    ids = []
     for it in items:
-        if isinstance(it, dict) and "id" in it:
-            ids.append(it["id"])
-        elif isinstance(it, str):
-            ids.append(it)
-    return ids
+        fid = catalog_parser.item_id(it)
+        if not fid:
+            skipped += 1
+            continue
 
+        name = catalog_parser.item_name(it)
+        raw = catalog_parser.to_raw_json(it)
 
-def sync_catalog(db: Session, pages: int = 1, start_offset: int = 0) -> Dict[str, Any]:
-    total_pulled = 0
-    total_upserted = 0
+        existing = db.execute(
+            select(CatalogItem).where(CatalogItem.fourover_id == fid)
+        ).scalar_one_or_none()
+
+        if existing:
+            existing.name = name
+            existing.raw_json = raw
+            updated += 1
+        else:
+            db.add(CatalogItem(fourover_id=fid, name=name, raw_json=raw))
+            inserted += 1
+
+    db.commit()
+    return {"inserted": inserted, "updated": updated, "skipped": skipped}
+
+def sync_catalog(db: Session, pages: int = 1, start_offset: int = 0, per_page_requested: int = 200) -> dict:
     offset = start_offset
-    total_results: Optional[int] = None
+    pulled_total = 0
+    last_page_size = None
+    total_results = None
 
     for _ in range(pages):
-        payload = pull_catalog_page(offset=offset, per_page_requested=200)
+        page = pull_catalog_page(offset=offset, per_page_requested=per_page_requested)
+        items = page["items"]
+        last_page_size = page["enforced_page_size"]
+        total_results = page["totalResults"]
 
-        if total_results is None:
-            total_results = payload.get("totalResults") or payload.get("total_results") or 0
+        pulled_total += len(items)
+        result = upsert_items(db, items)
 
-        ids = extract_ids(payload)
-        total_pulled += len(ids)
-        total_upserted += upsert_ids(db, ids)
+        # move forward by the actual enforced page size
+        offset += (last_page_size or 0)
 
-        offset += PAGE_SIZE_ASSUMED
-
-        if total_results and offset >= int(total_results):
+        # If nothing came back, stop early
+        if last_page_size == 0:
             break
 
     return {
@@ -91,8 +84,8 @@ def sync_catalog(db: Session, pages: int = 1, start_offset: int = 0) -> Dict[str
         "pages_requested": pages,
         "start_offset": start_offset,
         "end_offset": offset,
-        "page_size_assumed": PAGE_SIZE_ASSUMED,
-        "pulled_items": total_pulled,
-        "upserted_items": total_upserted,
-        "totalResults": int(total_results or 0),
+        "pulled_items": pulled_total,
+        "last_page_size": last_page_size,
+        "totalResults": total_results,
+        "db": "updated",
     }

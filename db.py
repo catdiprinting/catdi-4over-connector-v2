@@ -5,18 +5,19 @@ from sqlalchemy import (
     Column,
     Integer,
     String,
-    Text,
-    ForeignKey,
-    UniqueConstraint,
     Index,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-# Railway Postgres URLs sometimes start with postgres:// which SQLAlchemy wants as postgresql://
+# Normalize Railway-style URLs and force psycopg v3 driver for Postgres
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Force SQLAlchemy to use psycopg (v3) instead of psycopg2
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 engine = create_engine(
     DATABASE_URL,

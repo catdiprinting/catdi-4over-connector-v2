@@ -1,26 +1,23 @@
 import os
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import sessionmaker
 
-# Default to your Railway Postgres (but strongly prefer setting DATABASE_URL in Railway Variables)
-DEFAULT_DATABASE_URL = "postgresql://postgres:hEiDUmFjYAwMIxVEuQydPfEImKdKcIdA@ballast.proxy.rlwy.net:24014/railway"
+def _clean(s: str) -> str:
+    return (s or "").strip().strip('"').strip("'")
 
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL).strip()
+DATABASE_URL = _clean(os.getenv("DATABASE_URL", "sqlite:///./local.db"))
 
-# Railway sometimes uses postgres:// which SQLAlchemy wants as postgresql://
+# Fix common Railway / legacy prefix
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# Ensure we use psycopg (NOT psycopg2)
+if DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-Base = declarative_base()
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()

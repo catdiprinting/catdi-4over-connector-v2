@@ -1,15 +1,13 @@
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import Column, Integer, String, DateTime, func
+from sqlalchemy import Column, String, Text, DateTime, func
+from db import Base
 
-Base = declarative_base()
 
 class CatalogItem(Base):
     __tablename__ = "catalog_items"
 
-    id = Column(Integer, primary_key=True, index=True)
-    external_id = Column(String(80), unique=True, index=True, nullable=False)
-    name = Column(String(255), nullable=True)
-    category = Column(String(255), nullable=True)
+    # 4over UUIDs are strings; store them as the PK
+    id = Column(String(64), primary_key=True, index=True)
+    raw_json = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now(), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

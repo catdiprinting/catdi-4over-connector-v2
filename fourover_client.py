@@ -1,8 +1,7 @@
+import os
 import hashlib
 import hmac
-from typing import Any, Dict, Optional
 from urllib.parse import urlencode
-
 import requests
 
 
@@ -12,78 +11,57 @@ def _clean(s: str) -> str:
 
 class FourOverClient:
     """
-    Implements 4over API Key Authentication exactly as documented:
+    Minimal 4over client.
 
-    Signature:
+    Railway env vars:
+      FOUR_OVER_APIKEY
+      FOUR_OVER_PRIVATE_KEY
+      FOUR_OVER_BASE_URL (default: https://api.4over.com)
+
+    GET auth is query-string based:
+      ?apikey=...&signature=...&max=...&offset=...
+
+    Signature (matches 4over docs/email guidance style):
       hmac_key = sha256(private_key).hexdigest()
       signature = HMAC_SHA256(hmac_key, HTTP_METHOD)
 
-    GET/DELETE: signature passed as query param alongside apikey
-      ?apikey={PUBLIC_KEY}&signature={SIGNATURE}
-
-    POST/PUT/PATCH: signature passed via header
-      Authorization: API {PUBLIC_KEY}:{SIGNATURE}
-
-    NOTE: Per docs, signature depends on HTTP_METHOD ONLY (not path/query).
+    NOTE: private keys can be short (like X0PHN5KK). That's okay.
     """
 
-    def __init__(self, api_key: str, private_key: str, base_url: str = "https://api.4over.com"):
-        api_key = _clean(api_key)
-        private_key = _clean(private_key)
-        base_url = _clean(base_url) or "https://api.4over.com"
+    def __init__(self):
+        self.api_key = _clean(os.getenv("FOUR_OVER_APIKEY", ""))
+        self.private_key = _clean(os.getenv("FOUR_OVER_PRIVATE_KEY", ""))
+        self.base_url = _clean(os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com")).rstrip("/")
 
-        if not api_key:
-            raise ValueError("Missing FOUR_OVER_APIKEY")
-        if not private_key or len(private_key) < 16:
-            raise ValueError(f"Missing/invalid FOUR_OVER_PRIVATE_KEY (len={len(private_key)})")
-        self.api_key = api_key
-        self.private_key = private_key
-        self.base_url = base_url.rstrip("/")
+        if not self.api_key:
+            raise RuntimeError("Missing env var FOUR_OVER_APIKEY")
+        if not self.private_key:
+            raise RuntimeError("Missing env var FOUR_OVER_PRIVATE_KEY")
 
         self.session = requests.Session()
-        self.timeout = (5, 25)
+        self.timeout = (5, 30)
 
-    def _signature_for_method(self, method: str) -> str:
+    def _signature(self, method: str) -> str:
         method = method.upper()
-
-        # Doc: hash('sha256', myPrivateKey)
         hmac_key = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest().encode("utf-8")
-
-        # Doc: HMAC(message=HTTP_METHOD)
         msg = method.encode("utf-8")
-
         return hmac.new(hmac_key, msg, hashlib.sha256).hexdigest()
 
-    def build_get_url(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def build_get_url(self, path: str, params: dict | None = None) -> tuple[str, dict]:
         if not path.startswith("/"):
             path = "/" + path
 
-        sig = self._signature_for_method("GET")
+        sig = self._signature("GET")
+        merged = {"apikey": self.api_key, "signature": sig, **(params or {})}
 
-        query = dict(params or {})
-        query["apikey"] = self.api_key
-        query["signature"] = sig
+        # stable ordering for debugging
+        qs = urlencode(sorted((k, str(v)) for k, v in merged.items() if v is not None))
 
-        qs = urlencode(sorted((k, str(v)) for k, v in query.items() if v is not None))
+        url = f"{self.base_url}{path}?{qs}"
+        debug = {"method": "GET", "path": path, "signature": sig, "url": url, "params": merged}
+        return url, debug
 
-        return {
-            "url": f"{self.base_url}{path}?{qs}",
-            "signature": sig,
-            "method": "GET",
-            "path": path,
-            "query": query,
-        }
-
-    def get_raw(self, path: str, params: Optional[Dict[str, Any]] = None):
-        built = self.build_get_url(path, params=params)
-        resp = self.session.get(built["url"], timeout=self.timeout)
-        return resp, built
-
-    def whoami(self):
-        return self.get_raw("/whoami")
-
-    def products(self, max: int = 20, offset: int = 0, q: Optional[str] = None):
-        params: Dict[str, Any] = {"max": max, "offset": offset}
-        if q:
-            params["q"] = q
-        return self.get_raw("/products", params=params)
+    def get(self, path: str, params: dict | None = None):
+        url, dbg = self.build_get_url(path, params=params)
+        r = self.session.get(url, timeout=self.timeout)
+        return r, dbg

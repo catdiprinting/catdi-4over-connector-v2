@@ -1,21 +1,13 @@
 # db.py
 import os
 from sqlalchemy import (
-    create_engine,
-    Column,
-    Integer,
-    String,
-    Text,
-    ForeignKey,
-    UniqueConstraint,
+    create_engine, Column, Integer, String, Text, ForeignKey, UniqueConstraint
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-# Railway will set DATABASE_URL for Postgres.
-# Local fallback uses SQLite.
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-# Railway Postgres sometimes uses postgres:// which SQLAlchemy expects as postgresql://
+# Railway Postgres URLs sometimes start with postgres:// which SQLAlchemy wants as postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -24,7 +16,6 @@ engine = create_engine(
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
     pool_pre_ping=True,
 )
-
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -35,7 +26,6 @@ Base = declarative_base()
 
 class CatalogSize(Base):
     __tablename__ = "catalog_sizes"
-
     id = Column(Integer, primary_key=True)
     display = Column(String(50), nullable=False, unique=True)  # e.g. 2" x 3.5"
     code = Column(String(50), nullable=True)                   # e.g. 2X3.5
@@ -45,7 +35,6 @@ class CatalogSize(Base):
 
 class CatalogLine(Base):
     __tablename__ = "catalog_lines"
-
     id = Column(Integer, primary_key=True)
     family = Column(String(50), nullable=False)                # e.g. Business Cards
     name = Column(String(140), nullable=False)                 # e.g. 14pt Matte/Dull
@@ -59,7 +48,6 @@ class CatalogLine(Base):
 
 class CatalogProduct(Base):
     __tablename__ = "catalog_products"
-
     id = Column(Integer, primary_key=True)
 
     product_uuid = Column(String(64), nullable=False, unique=True)
@@ -77,13 +65,10 @@ class CatalogProduct(Base):
 # Helpers
 # -------------------
 
-def init_db() -> None:
-    """Create tables if they do not exist."""
+def init_db():
     Base.metadata.create_all(bind=engine)
 
-
 def get_db():
-    """FastAPI dependency generator."""
     db = SessionLocal()
     try:
         yield db

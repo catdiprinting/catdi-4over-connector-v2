@@ -1,96 +1,65 @@
 # fourover_client.py
 import hashlib
 import hmac
-import os
-from typing import Any, Dict, Optional
+import time
+from urllib.parse import urlencode
 
 import requests
 
 
-def _clean_secret(value: str) -> str:
-    return (value or "").strip()
-
-
-def fourover_signature(private_key: str, http_method: str) -> str:
-    """
-    4over signature:
-      key = sha256(private_key).hexdigest()
-      signature = hmac_sha256(key, HTTP_METHOD).hexdigest()
-    """
-    pk = _clean_secret(private_key).encode("utf-8")
-    pk_hash_hex = hashlib.sha256(pk).hexdigest().encode("utf-8")
-    msg = http_method.upper().encode("utf-8")
-    return hmac.new(pk_hash_hex, msg, hashlib.sha256).hexdigest()
-
-
 class FourOverClient:
-    def __init__(
-        self,
-        base_url: Optional[str] = None,
-        apikey: Optional[str] = None,
-        private_key: Optional[str] = None,
-        timeout: int = 60,
-    ) -> None:
-        self.base_url = (base_url or os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").rstrip("/")
-        self.apikey = _clean_secret(apikey or os.getenv("FOUR_OVER_APIKEY") or "")
-        self.private_key = _clean_secret(private_key or os.getenv("FOUR_OVER_PRIVATE_KEY") or "")
-        self.timeout = timeout
+    """
+    Minimal 4over client using API key + private key signature.
+    We build URLs as:
+      {base}{path}?apikey=...&signature=...&{other query params}
 
-        if not self.apikey:
-            raise ValueError("FOUR_OVER_APIKEY is missing")
-        if not self.private_key:
-            raise ValueError("FOUR_OVER_PRIVATE_KEY is missing")
+    Signature is HMAC-SHA256(private_key, canonical_string)
+    canonical_string = f"{path}?apikey={apikey}"   (then append any other query params in sorted order)
+    """
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        params: Optional[Dict[str, Any]] = None,
-        json: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        method = method.upper()
-        path = "/" + path.lstrip("/")
-        url = f"{self.base_url}{path}"
+    def __init__(self, api_key: str, private_key: str, base_url: str = "https://api.4over.com"):
+        if not api_key or not private_key:
+            raise ValueError("FOUROVER_API_KEY and FOUROVER_PRIVATE_KEY are required.")
+        self.api_key = api_key
+        self.private_key = private_key.encode("utf-8")
+        self.base_url = base_url.rstrip("/")
 
-        sig = fourover_signature(self.private_key, method)
+    def _canonical(self, path: str, params: dict) -> str:
+        # apikey must be included in canonical
+        merged = {"apikey": self.api_key, **(params or {})}
+        # Sort params for stable canonical string
+        items = sorted((k, str(v)) for k, v in merged.items() if v is not None)
+        qs = urlencode(items)
+        return f"{path}?{qs}"
 
-        params_out = dict(params or {})
-        headers: Dict[str, str] = {}
+    def _sign(self, canonical: str) -> str:
+        return hmac.new(self.private_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
-        # GET/DELETE -> signature in QUERY
-        if method in ("GET", "DELETE"):
-            params_out["apikey"] = self.apikey
-            params_out["signature"] = sig
-        else:
-            headers["Authorization"] = f"API {self.apikey}:{sig}"
+    def build_url(self, path: str, params: dict | None = None) -> str:
+        if not path.startswith("/"):
+            path = "/" + path
 
-        r = requests.request(
-            method=method,
-            url=url,
-            params=params_out,
-            json=json,
-            headers=headers,
-            timeout=self.timeout,
-        )
+        canonical = self._canonical(path, params or {})
+        signature = self._sign(canonical)
 
-        try:
-            payload = r.json()
-        except Exception:
-            payload = {"raw": r.text}
+        # Final params include signature
+        merged = {"apikey": self.api_key, **(params or {}), "signature": signature}
+        items = sorted((k, str(v)) for k, v in merged.items() if v is not None)
+        qs = urlencode(items)
+        return f"{self.base_url}{path}?{qs}"
 
-        safe_sig = f"{sig[:6]}...{sig[-6:]} (len={len(sig)})"
-        dbg_query = dict(params_out)
-        if "signature" in dbg_query:
-            dbg_query["signature"] = safe_sig
+    def get(self, path: str, params: dict | None = None, timeout: int = 60):
+        url = self.build_url(path, params=params)
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
 
-        return {
-            "http_status": r.status_code,
-            "ok": r.ok,
-            "data": payload,
-            "debug": {
-                "url": url,
-                "method": method,
-                "query": dbg_query,
-                "auth_header": "present" if "Authorization" in headers else None,
-            },
-        }
+    # Convenience endpoints
+    def whoami(self):
+        return self.get("/whoami")
+
+    def products(self, q: str | None = None, limit: int = 50, offset: int = 0):
+        params = {"limit": limit, "offset": offset}
+        if q:
+            params["q"] = q
+        return self.get("/products", params=params)

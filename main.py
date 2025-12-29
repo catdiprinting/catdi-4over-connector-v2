@@ -2,313 +2,212 @@
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Query
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from db import init_db, get_db, CatalogGroup
 from fourover_client import FourOverClient
 
-APP_SERVICE = "catdi-4over-connector"
-PHASE = "0.8"
-BUILD = "catalog-explorer-enabled"
+load_dotenv()
 
-app = FastAPI(title="Catdi 4over Connector", version=f"{PHASE} - {BUILD}")
+APP_NAME = "catdi-4over-connector"
+PHASE = "0.6"
+BUILD = os.getenv("BUILD", "psycopg3-forced")
+
+FOUROVER_API_KEY = os.getenv("FOUROVER_API_KEY", "")
+FOUROVER_PRIVATE_KEY = os.getenv("FOUROVER_PRIVATE_KEY", "")
+FOUROVER_BASE_URL = os.getenv("FOUROVER_BASE_URL", "https://api.4over.com")
+
+# Create app
+app = FastAPI(title=APP_NAME)
+
+# Create 4over client (lazy-init)
+_client: Optional[FourOverClient] = None
+
+
+def four_over() -> FourOverClient:
+    global _client
+    if _client is None:
+        _client = FourOverClient(
+            api_key=FOUROVER_API_KEY,
+            private_key=FOUROVER_PRIVATE_KEY,
+            base_url=FOUROVER_BASE_URL,
+        )
+    return _client
 
 
 @app.on_event("startup")
-def _startup():
+def startup():
+    # Ensure tables exist (Phase 1)
     init_db()
 
 
-def _env_present() -> Dict[str, bool]:
-    keys = ["FOUR_OVER_APIKEY", "FOUR_OVER_PRIVATE_KEY", "FOUR_OVER_BASE_URL", "DATABASE_URL"]
-    return {k: bool(os.getenv(k)) for k in keys}
-
-
+# -------------------
+# Core utility routes
+# -------------------
 @app.get("/")
 def root():
-    return {"service": APP_SERVICE, "phase": PHASE, "build": BUILD}
+    return {"service": APP_NAME, "phase": PHASE, "build": BUILD}
 
 
 @app.get("/version")
 def version():
-    return {"service": APP_SERVICE, "phase": PHASE, "build": BUILD}
+    return {"service": APP_NAME, "phase": PHASE, "build": BUILD}
 
 
 @app.get("/health")
-def health(db: Session = Depends(get_db)):
-    try:
-        db.execute("SELECT 1")
-        db_ok = True
-        db_error = None
-    except Exception as e:
-        db_ok = False
-        db_error = str(e)
-
-    return {
-        "ok": db_ok,
-        "db_ok": db_ok,
-        "db_error": db_error,
-        "env_present": _env_present(),
-    }
+def health():
+    return {"ok": True}
 
 
 @app.get("/routes")
 def routes():
-    # lightweight route listing for debugging
-    routes_out = []
-    for r in app.routes:
-        methods = sorted(list(getattr(r, "methods", []) or []))
-        routes_out.append({"path": r.path, "methods": methods, "name": r.name})
-    return {"count": len(routes_out), "routes": routes_out}
+    # Useful for verifying deploy is correct
+    out = []
+    for r in app.router.routes:
+        methods = getattr(r, "methods", None)
+        path = getattr(r, "path", None)
+        name = getattr(r, "name", None)
+        if path:
+            out.append({"path": path, "methods": sorted(list(methods)) if methods else [], "name": name})
+    out = sorted(out, key=lambda x: x["path"])
+    return {"count": len(out), "routes": out}
 
 
-# -----------------------
-# 4over passthrough tools
-# -----------------------
-
+# -------------------
+# 4over debug/explore
+# -------------------
 @app.get("/4over/whoami")
-def fourover_whoami():
-    client = FourOverClient()
-    return client.request("GET", "/whoami")
-
-
-@app.get("/4over/explore-path")
-def fourover_explore_path(path: str = Query(..., description="Example: /products")):
-    client = FourOverClient()
-    resp = client.request("GET", path)
-    data = resp.get("data")
-
-    # summarize large payloads without exploding the response
-    summary: Dict[str, Any] = {"type": type(data).__name__}
-    data_preview: Any = None
-
+def four_over_whoami():
     try:
-        if isinstance(data, list):
-            summary["len"] = len(data)
-            if data:
-                summary["first_item_type"] = type(data[0]).__name__
-                summary["first_item_preview"] = str(data[0])[:600]
-            data_preview = str(data[:2])[:2500]
-        elif isinstance(data, dict):
-            summary["keys"] = list(data.keys())[:50]
-            summary["preview"] = {k: data.get(k) for k in list(data.keys())[:8]}
-            data_preview = {k: data.get(k) for k in list(data.keys())[:25]}
-        else:
-            data_preview = str(data)[:2500]
-    except Exception:
-        data_preview = "preview_failed"
-
-    return {
-        "ok": resp.get("ok", False),
-        "path": path,
-        "http_status": resp.get("http_status"),
-        "debug": resp.get("debug"),
-        "summary": summary,
-        "data_preview": data_preview,
-    }
+        return four_over().whoami()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/4over/explore")
-def fourover_explore(limit: int = 20):
+def four_over_explore():
     """
-    Tries common catalog-ish endpoints and reports which exist.
+    Safe default explorer landing.
     """
-    client = FourOverClient()
-    candidates = [
-        "/catalog", "/catalogs", "/categories", "/category",
-        "/products", "/product",
-        "/product-categories", "/product_categories",
-        "/productcatalog", "/product_catalog",
-        "/price", "/pricing", "/price-table", "/price_table",
-        "/turnaround",
-    ][: max(1, min(limit, 50))]
-
-    results = []
-    for p in candidates:
-        r = client.request("GET", p)
-        data = r.get("data")
-        summary: Dict[str, Any] = {"type": type(data).__name__}
-        if isinstance(data, list):
-            summary["len"] = len(data)
-            if data:
-                summary["first_item_preview"] = str(data[0])[:250]
-        elif isinstance(data, dict):
-            summary["keys"] = list(data.keys())[:20]
-            summary["preview"] = {k: data.get(k) for k in list(data.keys())[:5]}
-
-        results.append({
-            "path": p,
-            "http_status": r.get("http_status"),
-            "ok": r.get("ok"),
-            "debug": r.get("debug"),
-            "summary": summary,
-            "data_preview": (str(data)[:900] if not isinstance(data, dict) else data),
-        })
-
-    return {"ok": True, "tested": len(candidates), "candidates": candidates, "results": results}
-
-
-# -----------------------
-# Admin: smoke test
-# -----------------------
-
-@app.post("/admin/sync-products")
-def sync_products_smoke(db: Session = Depends(get_db)):
-    # DB test
-    db_ok, db_error = True, None
-    try:
-        db.execute("SELECT 1")
-    except Exception as e:
-        db_ok, db_error = False, str(e)
-
-    # 4over test
-    fourover_ok, fourover_http_status, fourover_error = True, None, None
-    try:
-        client = FourOverClient()
-        r = client.request("GET", "/whoami")
-        fourover_ok = bool(r.get("ok"))
-        fourover_http_status = r.get("http_status")
-        if not fourover_ok:
-            fourover_error = str(r.get("data"))
-    except Exception as e:
-        fourover_ok, fourover_error = False, str(e)
-
     return {
-        "ok": True,
-        "message": "sync endpoint reached",
-        "db_ok": db_ok,
-        "db_error": db_error,
-        "fourover_ok": fourover_ok,
-        "fourover_http_status": fourover_http_status,
-        "fourover_error": fourover_error,
-        "env_present": _env_present(),
+        "hint": "Use /4over/explore-path?path=/products or /4over/explore-path?path=/products&q=door",
+        "examples": [
+            "/4over/explore-path?path=/products",
+            "/4over/explore-path?path=/products&q=door",
+            "/4over/explore-path?path=/whoami",
+        ],
     }
 
 
-# -----------------------
-# Admin: build GROUP index (Phase 1)
-# -----------------------
+@app.get("/4over/explore-path")
+def four_over_explore_path(
+    path: str = Query(..., description="4over API path starting with / e.g. /products"),
+    q: Optional[str] = Query(None, description="Optional 4over 'q' search param"),
+    limit: int = Query(50, ge=1, le=500, description="limit for endpoints that support it"),
+    offset: int = Query(0, ge=0, description="offset for endpoints that support it"),
+):
+    try:
+        params = {}
+        # Only include params that make sense
+        if q:
+            params["q"] = q
+        # Many endpoints accept limit/offset; harmless if ignored, but we keep it explicit
+        params["limit"] = limit
+        params["offset"] = offset
 
-@app.post("/admin/build-groups")
-def admin_build_groups(
+        return four_over().get(path, params=params)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -------------------
+# Admin: Phase 1 sync (Groups only)
+# -------------------
+@app.post("/admin/sync-products")
+def admin_sync_products(
+    q: str = Query(..., description="Search query to filter 4over /products, e.g. door"),
+    limit: int = Query(200, ge=1, le=2000, description="How many product rows to scan from 4over"),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    limit: Optional[int] = Query(None, description="Optional: limit products processed (for quick tests)"),
 ):
     """
-    Pull /products once, extract unique (groupid, groupname) and store to DB.
+    Phase 1: Pull a slice of /products and upsert unique groups into catalog_groups.
+    This is intentionally small + safe.
     """
-    client = FourOverClient()
-    r = client.request("GET", "/products")
+    try:
+        data = four_over().products(q=q, limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"4over fetch failed: {e}")
 
-    if not r.get("ok"):
-        return {
-            "ok": False,
-            "message": "4over /products failed",
-            "http_status": r.get("http_status"),
-            "data": r.get("data"),
-            "debug": r.get("debug"),
-        }
+    # 4over /products often returns a list, or sometimes a dict with items
+    rows: List[Dict[str, Any]] = []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        # try common keys
+        for key in ("items", "data", "results", "products"):
+            if key in data and isinstance(data[key], list):
+                rows = data[key]
+                break
+        if not rows and "0" in data:
+            # weird shape fallback
+            pass
 
-    products = r.get("data")
-    if not isinstance(products, list):
-        return {"ok": False, "message": "Unexpected /products response type", "type": type(products).__name__}
+    if not rows:
+        return {"ok": True, "message": "No rows returned from 4over (or unexpected shape).", "saved_groups": 0}
 
+    saved = 0
     seen = set()
-    inserted = 0
-    updated = 0
-    processed = 0
 
-    for p in products:
-        if not isinstance(p, dict):
-            continue
-        processed += 1
-        if limit and processed > limit:
-            break
+    for r in rows:
+        groupid = str(r.get("groupid") or "").strip()
+        groupname = str(r.get("groupname") or "").strip()
 
-        gid = p.get("groupid")
-        gname = p.get("groupname")
-        if not gid or not gname:
+        if not groupid or not groupname:
             continue
 
-        key = (gid, gname)
-        if key in seen:
+        if groupid in seen:
             continue
-        seen.add(key)
+        seen.add(groupid)
 
-        existing = db.query(CatalogGroup).filter(CatalogGroup.group_uuid == gid).first()
+        existing = db.query(CatalogGroup).filter(CatalogGroup.group_uuid == groupid).first()
         if existing:
-            if existing.group_name != gname:
-                existing.group_name = gname
-                updated += 1
-        else:
-            db.add(CatalogGroup(
-                group_uuid=gid,
-                group_name=gname,
-                sample_product_uuid=p.get("id"),
-                sample_product_name=p.get("name"),
-            ))
-            inserted += 1
+            # update name if changed (rare)
+            if existing.group_name != groupname:
+                existing.group_name = groupname
+            continue
+
+        sample_product_uuid = str(r.get("productid") or r.get("id") or "").strip() or None
+        sample_product_name = str(r.get("productname") or r.get("name") or "").strip() or None
+
+        cg = CatalogGroup(
+            group_uuid=groupid,
+            group_name=groupname,
+            sample_product_uuid=sample_product_uuid,
+            sample_product_name=sample_product_name,
+        )
+        db.add(cg)
+        saved += 1
 
     db.commit()
 
     return {
         "ok": True,
-        "message": "groups indexed",
-        "processed_products": processed,
+        "query": q,
+        "limit": limit,
+        "offset": offset,
+        "rows_scanned": len(rows),
         "unique_groups_seen": len(seen),
-        "inserted": inserted,
-        "updated": updated,
+        "saved_groups": saved,
     }
 
 
-# -----------------------
-# Catalog Explorer endpoints (fast UX)
-# -----------------------
-
-@app.get("/catalog/groups")
-def catalog_groups(db: Session = Depends(get_db), limit: int = 200):
-    rows = (
-        db.query(CatalogGroup)
-        .order_by(CatalogGroup.group_name.asc())
-        .limit(max(1, min(limit, 2000)))
-        .all()
-    )
-    return {
-        "ok": True,
-        "count": len(rows),
-        "groups": [
-            {
-                "groupid": r.group_uuid,
-                "groupname": r.group_name,
-                "sample_product_uuid": r.sample_product_uuid,
-                "sample_product_name": r.sample_product_name,
-            }
-            for r in rows
-        ],
-    }
-
-
+# -------------------
+# Catalog: read-only (Phase 1)
+# -------------------
 @app.get("/catalog/groups/search")
 def catalog_groups_search(
-    q: str = Query(..., description="Example: door"),
-    db: Session = Depends(get_db),
-    limit: int = 50,
-):
-    qq = f"%{q.strip()}%"
-    rows = (
-        db.query(CatalogGroup)
-        .filter(CatalogGroup.group_name.ilike(qq))
-        .order_by(CatalogGroup.group_name.asc())
-        .limit(max(1, min(limit, 200)))
-        .all()
-    )
-    return {
-        "ok": True,
-        "q": q,
-        "count": len(rows),
-        "groups": [
-            {"groupid": r.group_uuid, "groupname": r.group_name}
-            for r in rows
-        ],
-    }
+    q: str = Query(..., min_length=1),
+    limit: int = Query(

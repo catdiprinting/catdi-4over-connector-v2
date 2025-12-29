@@ -1,7 +1,14 @@
 # db.py
 import os
 from sqlalchemy import (
-    create_engine, Column, Integer, String, Text, ForeignKey, UniqueConstraint
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Text,
+    ForeignKey,
+    UniqueConstraint,
+    Index,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
@@ -16,49 +23,27 @@ engine = create_engine(
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
     pool_pre_ping=True,
 )
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+
 # -------------------
-# Models
+# Catalog models (Phase 1: Groups only)
 # -------------------
 
-class CatalogSize(Base):
-    __tablename__ = "catalog_sizes"
+class CatalogGroup(Base):
+    __tablename__ = "catalog_groups"
     id = Column(Integer, primary_key=True)
-    display = Column(String(50), nullable=False, unique=True)  # e.g. 2" x 3.5"
-    code = Column(String(50), nullable=True)                   # e.g. 2X3.5
 
-    products = relationship("CatalogProduct", back_populates="size")
-
-
-class CatalogLine(Base):
-    __tablename__ = "catalog_lines"
-    id = Column(Integer, primary_key=True)
-    family = Column(String(50), nullable=False)                # e.g. Business Cards
-    name = Column(String(140), nullable=False)                 # e.g. 14pt Matte/Dull
-
-    products = relationship("CatalogProduct", back_populates="line")
+    group_uuid = Column(String(64), nullable=False, unique=True)  # 4over groupid
+    group_name = Column(String(180), nullable=False)              # 4over groupname
+    sample_product_uuid = Column(String(64), nullable=True)       # optional
+    sample_product_name = Column(String(200), nullable=True)      # optional
 
     __table_args__ = (
-        UniqueConstraint("family", "name", name="uq_family_line"),
+        Index("ix_catalog_groups_group_name", "group_name"),
     )
-
-
-class CatalogProduct(Base):
-    __tablename__ = "catalog_products"
-    id = Column(Integer, primary_key=True)
-
-    product_uuid = Column(String(64), nullable=False, unique=True)
-    product_code = Column(String(120), nullable=False)
-    description = Column(Text, nullable=True)
-
-    size_id = Column(Integer, ForeignKey("catalog_sizes.id"), nullable=False)
-    line_id = Column(Integer, ForeignKey("catalog_lines.id"), nullable=False)
-
-    size = relationship("CatalogSize", back_populates="products")
-    line = relationship("CatalogLine", back_populates="products")
 
 
 # -------------------

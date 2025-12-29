@@ -1,115 +1,112 @@
 import os
 import time
-import hmac
 import hashlib
+import hmac
 import requests
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
-def _clean_env(v: str | None) -> str | None:
-    if v is None:
-        return None
-    return v.strip()
 
-def _first_env(*keys: str) -> str | None:
-    for k in keys:
-        v = _clean_env(os.getenv(k))
-        if v:
-            return v
-    return None
+def normalize_private_key(pk: str) -> str:
+    # Env vars frequently carry trailing newlines/spaces
+    return (pk or "").strip()
+
+
+def build_canonical_path_and_query(path: str, query: dict) -> str:
+    # Must include apikey; must exclude signature
+    items = sorted(
+        (k, str(v))
+        for k, v in (query or {}).items()
+        if v is not None and k != "signature"
+    )
+    qs = urlencode(items)
+    return f"{path}?{qs}" if qs else path
+
+
+def sign_4over_request(method: str, canonical_path_and_query: str, private_key: str) -> str:
+    pk = normalize_private_key(private_key)
+    # per project discovery: hmac_key = sha256(private_key) THEN HMAC_SHA256(...)
+    hmac_key = hashlib.sha256(pk.encode("utf-8")).hexdigest().encode("utf-8")
+    message = (method.upper() + canonical_path_and_query).encode("utf-8")
+    return hmac.new(hmac_key, message, hashlib.sha256).hexdigest()
+
 
 class FourOverClient:
     """
-    Signs requests using:
-      key = sha256(private_key).digest()
-      msg = METHOD + canonical_path_with_sorted_query (excluding signature)
-      signature = hmac_sha256(key, msg).hexdigest()
+    Single canonical client. All signing happens here.
     """
 
-    def __init__(self, base_url: str | None = None, apikey: str | None = None, private_key: str | None = None):
-        self.base_url = (base_url or _first_env("FOUR_OVER_BASE_URL", "FOUROVER_BASE_URL") or "https://api.4over.com").rstrip("/")
-
-        # Accept YOUR Railway env var names + common variants
-        self.apikey = apikey or _first_env(
-            "FOUR_OVER_APIKEY",
-            "FOUR_OVER_API_KEY",
-            "FOUROVER_APIKEY",
-            "FOUROVER_API_KEY",
-            "FOUROVER_APIKEY",
-        )
-
-        self.private_key = private_key or _first_env(
-            "FOUR_OVER_PRIVATE_KEY",
-            "FOUROVER_PRIVATE_KEY",
-            "FOUROVER_PRIVATEKEY",
-        )
+    def __init__(
+        self,
+        base_url: str | None = None,
+        apikey: str | None = None,
+        private_key: str | None = None,
+        timeout_connect: float = 5.0,
+        timeout_read: float = 30.0,
+        max_retries: int = 3,
+        backoff_base: float = 0.6,
+    ):
+        self.base_url = (base_url or os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com")).rstrip("/")
+        self.apikey = apikey or os.getenv("FOUR_OVER_APIKEY", "")
+        self.private_key = private_key or os.getenv("FOUR_OVER_PRIVATE_KEY", "")
+        self.timeout = (timeout_connect, timeout_read)
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
 
         if not self.apikey or not self.private_key:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY (or variant) or FOUR_OVER_PRIVATE_KEY (or variant) in env vars")
+            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
 
-        # HMAC key is sha256(private_key) as bytes
-        self._hmac_key = hashlib.sha256(self.private_key.encode("utf-8")).digest()
+        # Session for keep-alive
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json"})
 
-        self._session = requests.Session()
-        self._timeout = (10, 60)  # connect, read
-
-    def _canonical(self, path: str, params: dict) -> str:
-        """
-        Canonical string:
-          path + '?' + sorted_query
-        Must include apikey; must exclude signature.
-        """
-        qp = {}
-        for k, v in (params or {}).items():
-            if v is None:
-                continue
-            if k.lower() == "signature":
-                continue
-            qp[k] = str(v)
-
-        # Ensure apikey is always present
-        qp["apikey"] = self.apikey
-
-        # Sort params by key for stable signing
-        items = sorted(qp.items(), key=lambda kv: kv[0])
-        query = urlencode(items, doseq=True)
-
-        return f"{path}?{query}" if query else path
-
-    def _sign(self, method: str, canonical: str) -> str:
-        msg = (method.upper() + canonical).encode("utf-8")
-        return hmac.new(self._hmac_key, msg, hashlib.sha256).hexdigest()
-
-    def _request(self, method: str, path: str, params: dict | None = None):
+    def _signed_params(self, method: str, path: str, params: dict | None):
         params = dict(params or {})
-        canonical = self._canonical(path, params)
-        signature = self._sign(method, canonical)
+        params["apikey"] = self.apikey
 
-        # Send params including signature + apikey
-        send_params = dict(params)
-        send_params["apikey"] = self.apikey
-        send_params["signature"] = signature
+        canonical = build_canonical_path_and_query(path, params)
+        signature = sign_4over_request(method, canonical, self.private_key)
 
-        url = f"{self.base_url}{path}"
+        # Actual request params include signature
+        signed = dict(params)
+        signed["signature"] = signature
+        return signed, canonical, signature
 
-        # Light retry for transient 502/504/rate issues
+    def request(self, method: str, path: str, params: dict | None = None):
+        method = method.upper()
+        signed_params, canonical, signature = self._signed_params(method, path, params)
+
+        url = urljoin(self.base_url + "/", path.lstrip("/"))
+
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(1, self.max_retries + 1):
             try:
-                resp = self._session.request(method.upper(), url, params=send_params, timeout=self._timeout)
-                if resp.status_code in (502, 503, 504):
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                resp.raise_for_status()
-                return resp.json()
-            except Exception as e:
+                resp = self.session.request(
+                    method,
+                    url,
+                    params=signed_params,
+                    timeout=self.timeout,
+                )
+
+                # Retry on throttling or transient server errors
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    if attempt < self.max_retries:
+                        time.sleep(self.backoff_base * (2 ** (attempt - 1)))
+                        continue
+
+                return resp, {"url": url, "canonical": canonical, "signature": signature}
+
+            except requests.RequestException as e:
                 last_exc = e
-                time.sleep(0.5 * (attempt + 1))
+                if attempt < self.max_retries:
+                    time.sleep(self.backoff_base * (2 ** (attempt - 1)))
+                    continue
+                raise
 
-        raise last_exc
+        # Should never hit, but just in case
+        raise last_exc or RuntimeError("Unknown request failure")
 
-    def whoami(self):
-        return self._request("GET", "/whoami")
-
-    def products(self, offset: int = 0, per_page: int = 200):
-        # 4over enforces perPage cap (often 20). We request high but honor returned count.
-        return self._request("GET", "/products", params={"offset": offset, "perPage": per_page})
+    def debug_sign(self, method: str, path: str, params: dict | None = None):
+        method = method.upper()
+        signed_params, canonical, signature = self._signed_params(method, path, params)
+        # Return signed params too (apikey masked in caller)
+        return signed_params, canonical, signature

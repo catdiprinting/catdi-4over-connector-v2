@@ -1,44 +1,35 @@
-import os
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from db import engine
 from models import Base
 
-# IMPORTANT: this must exist in catalog_sync.py
-from catalog_sync import router as catalog_router
+app = FastAPI(title="catdi-4over-connector", version="0.8")
 
-app = FastAPI(title="catdi-4over-connector", version="0.7")
-
-# CORS (safe default for testing)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Create DB tables on startup
 @app.on_event("startup")
 def startup():
+    # Create tables (won't drop anything)
     Base.metadata.create_all(bind=engine)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "catdi-4over-connector"}
+    return {"ok": True, "service": "catdi-4over-connector", "version": "0.8"}
 
 @app.get("/health/db")
 def health_db():
-    # db.py usually exposes a SessionLocal; we can safely do a simple connection test via engine
     try:
         with engine.connect() as conn:
-            conn.execute("SELECT 1")
-        # Show host (helps confirm env is correct)
-        db_url = os.getenv("DATABASE_URL", "")
-        return {"ok": True, "db": "ok", "db_host": db_url.split("@")[-1] if "@" in db_url else db_url}
+            conn.execute(text("SELECT 1"))
+        return {"ok": True, "db": "ok"}
     except Exception as e:
         return {"ok": False, "db": "failed", "error": str(e)}
 
-# Mount catalog routes here
-app.include_router(catalog_router, prefix="/catalog", tags=["catalog"])
+# --- Optional: only mount catalog routes if file exists & imports cleanly ---
+try:
+    from catalog_sync import router as catalog_router
+    app.include_router(catalog_router, prefix="/catalog", tags=["catalog"])
+except Exception as e:
+    # If catalog import breaks, app still boots and you can see why here
+    @app.get("/health/catalog")
+    def health_catalog():
+        return {"ok": False, "catalog_routes_loaded": False, "error": str(e)}

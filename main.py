@@ -1,29 +1,29 @@
-import os
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+
 from fourover_client import FourOverClient
 
 APP_NAME = "catdi-4over-connector"
-PHASE = "baseline"
-BUILD = "boot-proof-no-db"
-
+PHASE = "RESET"
+BUILD = "doc-signature-method-only-max-offset"
 
 app = FastAPI(title=APP_NAME)
 
-
-def mask(s: str, keep: int = 4) -> str:
-    if not s:
-        return ""
-    if len(s) <= keep:
-        return "*" * len(s)
-    return "*" * (len(s) - keep) + s[-keep:]
+_client: FourOverClient | None = None
 
 
-def client() -> FourOverClient:
+def four_over() -> FourOverClient:
+    global _client
+    if _client is None:
+        _client = FourOverClient()
+    return _client
+
+
+def _json_or_text(resp):
     try:
-        return FourOverClient()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return resp.json()
+    except Exception:
+        return {"raw": (resp.text or "")[:2000]}
 
 
 @app.get("/")
@@ -33,7 +33,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP_NAME, "phase": PHASE, "build": BUILD}
+    return {"ok": True}
 
 
 @app.get("/version")
@@ -43,60 +43,99 @@ def version():
 
 @app.get("/env")
 def env():
+    # minimal sanity (no secrets)
+    import os
+    pk = (os.getenv("FOUR_OVER_PRIVATE_KEY", "") or "").strip()
+    ak = (os.getenv("FOUR_OVER_APIKEY", "") or "").strip()
+    bu = (os.getenv("FOUR_OVER_BASE_URL", "") or "").strip()
     return {
-        "FOUR_OVER_BASE_URL": (os.getenv("FOUR_OVER_BASE_URL", "") or "").rstrip("/"),
-        "FOUR_OVER_APIKEY_masked": mask(os.getenv("FOUR_OVER_APIKEY", "")),
-        "FOUR_OVER_PRIVATE_KEY_len": len((os.getenv("FOUR_OVER_PRIVATE_KEY", "") or "")),
-        "DATABASE_URL_present": bool(os.getenv("DATABASE_URL")),
+        "FOUR_OVER_BASE_URL": bu,
+        "FOUR_OVER_APIKEY_last4": ak[-4:] if ak else "",
+        "FOUR_OVER_PRIVATE_KEY_len": len(pk),
     }
 
 
-@app.get("/debug/sign")
-def debug_sign(
-    path: str = Query("/whoami"),
-):
-    c = client()
-    # Build signature without calling upstream (safe)
-    resp, dbg = c.get(path, params={})
-    # We only need the canonical/signature; don't require upstream to be healthy
-    return {"ok": True, "path": path, "canonical": dbg["canonical"], "signature": dbg["signature"]}
+@app.get("/4over/debug/whoami")
+def debug_whoami():
+    """
+    Returns status + response + exact URL used (includes signature) for debugging.
+    """
+    try:
+        r, dbg = four_over().get("/whoami", params={})
+        return {
+            "ok": r.ok,
+            "http_status": r.status_code,
+            "body": _json_or_text(r),
+            "debug": dbg,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/4over/whoami")
 def whoami():
-    c = client()
-    resp, dbg = c.get("/whoami", params={})
     try:
-        data = resp.json()
-    except Exception:
-        data = {"raw": resp.text}
-
-    return {
-        "ok": resp.ok,
-        "http_status": resp.status_code,
-        "data": data if resp.ok else None,
-        "error": None if resp.ok else data,
-        "debug": dbg if not resp.ok else None,
-    }
+        r, _dbg = four_over().get("/whoami", params={})
+        if not r.ok:
+            return JSONResponse(status_code=r.status_code, content=_json_or_text(r))
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/4over/products")
-def products(
-    max: int = Query(20, ge=1, le=200),
-    offset: int = Query(0, ge=0, le=10000000),
+# --------- Endpoints referenced in the 4over email thread ---------
+
+@app.get("/4over/printproducts/categories")
+def categories(
+    max: int = Query(1000, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
 ):
-    c = client()
-    resp, dbg = c.get("/products", params={"max": max, "offset": offset})
+    """
+    4over dev: "In each GET API, you need to pass max and offset parameters."
+    """
     try:
-        data = resp.json()
-    except Exception:
-        data = {"raw": resp.text}
+        r, dbg = four_over().get("/printproducts/categories", params={"max": max, "offset": offset})
+        if not r.ok:
+            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {
-        "ok": resp.ok,
-        "http_status": resp.status_code,
-        "request": {"max": max, "offset": offset},
-        "data": data if resp.ok else None,
-        "error": None if resp.ok else data,
-        "debug": dbg if not resp.ok else None,
-    }
+
+@app.get("/4over/printproducts/categories/{category_uuid}/products")
+def category_products(
+    category_uuid: str,
+    max: int = Query(1000, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
+    """
+    4over dev steps:
+      a) GET /printproducts/categories
+      b) GET /printproducts/categories/{category_uuid}/products
+    """
+    try:
+        path = f"/printproducts/categories/{category_uuid}/products"
+        r, dbg = four_over().get(path, params={"max": max, "offset": offset})
+        if not r.ok:
+            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/4over/printproducts/products")
+def printproducts_products(
+    max: int = Query(1000, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Mentioned in the emails:
+      https://api.4over.com/printproducts/products?apikey=catdi&signature=SIGNATURE
+    """
+    try:
+        r, dbg = four_over().get("/printproducts/products", params={"max": max, "offset": offset})
+        if not r.ok:
+            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+        return r.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

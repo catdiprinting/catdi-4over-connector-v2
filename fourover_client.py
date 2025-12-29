@@ -5,94 +5,111 @@ import hashlib
 import requests
 from urllib.parse import urlencode
 
+def _clean_env(v: str | None) -> str | None:
+    if v is None:
+        return None
+    return v.strip()
+
+def _first_env(*keys: str) -> str | None:
+    for k in keys:
+        v = _clean_env(os.getenv(k))
+        if v:
+            return v
+    return None
+
 class FourOverClient:
     """
-    4over signing notes (based on your previously-working behavior):
-    - key_for_hmac = sha256(private_key)  (hex digest bytes)
-    - signature = HMAC-SHA256(key_for_hmac, canonical_string)
-    - canonical_string = path + '?' + sorted_querystring (must include apikey; exclude signature)
+    Signs requests using:
+      key = sha256(private_key).digest()
+      msg = METHOD + canonical_path_with_sorted_query (excluding signature)
+      signature = hmac_sha256(key, msg).hexdigest()
     """
 
-    def __init__(self):
-        # Accept either env naming style
-        self.api_key = (
-            os.getenv("FOUROVER_API_KEY")
-            or os.getenv("FOUR_OVER_APIKEY")
-            or os.getenv("FOUR_OVER_API_KEY")
-            or ""
-        ).strip()
+    def __init__(self, base_url: str | None = None, apikey: str | None = None, private_key: str | None = None):
+        self.base_url = (base_url or _first_env("FOUR_OVER_BASE_URL", "FOUROVER_BASE_URL") or "https://api.4over.com").rstrip("/")
 
-        self.private_key = (
-            os.getenv("FOUROVER_PRIVATE_KEY")
-            or os.getenv("FOUR_OVER_PRIVATE_KEY")
-            or ""
-        ).strip()
+        # Accept YOUR Railway env var names + common variants
+        self.apikey = apikey or _first_env(
+            "FOUR_OVER_APIKEY",
+            "FOUR_OVER_API_KEY",
+            "FOUROVER_APIKEY",
+            "FOUROVER_API_KEY",
+            "FOUROVER_APIKEY",
+        )
 
-        self.base_url = (
-            os.getenv("FOUROVER_BASE_URL")
-            or os.getenv("FOUR_OVER_BASE_URL")
-            or "https://api.4over.com"
-        ).strip().rstrip("/")
+        self.private_key = private_key or _first_env(
+            "FOUR_OVER_PRIVATE_KEY",
+            "FOUROVER_PRIVATE_KEY",
+            "FOUROVER_PRIVATEKEY",
+        )
 
-        if not self.api_key or not self.private_key:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY/FOUR_OVER_PRIVATE_KEY (or FOUROVER_*) in env vars")
+        if not self.apikey or not self.private_key:
+            raise RuntimeError("Missing FOUR_OVER_APIKEY (or variant) or FOUR_OVER_PRIVATE_KEY (or variant) in env vars")
 
-        self.session = requests.Session()
+        # HMAC key is sha256(private_key) as bytes
+        self._hmac_key = hashlib.sha256(self.private_key.encode("utf-8")).digest()
 
-        # HMAC key is sha256(private_key) (HEX digest bytes)
-        sha = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
-        self.hmac_key = sha.encode("utf-8")
+        self._session = requests.Session()
+        self._timeout = (10, 60)  # connect, read
 
     def _canonical(self, path: str, params: dict) -> str:
-        # Remove signature from canonical inputs if present
-        cleaned = {k: v for k, v in params.items() if k != "signature" and v is not None}
+        """
+        Canonical string:
+          path + '?' + sorted_query
+        Must include apikey; must exclude signature.
+        """
+        qp = {}
+        for k, v in (params or {}).items():
+            if v is None:
+                continue
+            if k.lower() == "signature":
+                continue
+            qp[k] = str(v)
 
-        # Sort params by key (string)
-        sorted_items = sorted((str(k), str(v)) for k, v in cleaned.items())
+        # Ensure apikey is always present
+        qp["apikey"] = self.apikey
 
-        qs = urlencode(sorted_items)
-        return f"{path}?{qs}" if qs else path
+        # Sort params by key for stable signing
+        items = sorted(qp.items(), key=lambda kv: kv[0])
+        query = urlencode(items, doseq=True)
 
-    def _sign(self, canonical: str) -> str:
-        return hmac.new(self.hmac_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"{path}?{query}" if query else path
 
-    def request(self, method: str, path: str, params: dict | None = None, timeout: int = 30):
+    def _sign(self, method: str, canonical: str) -> str:
+        msg = (method.upper() + canonical).encode("utf-8")
+        return hmac.new(self._hmac_key, msg, hashlib.sha256).hexdigest()
+
+    def _request(self, method: str, path: str, params: dict | None = None):
         params = dict(params or {})
-
-        # Ensure apikey is always included
-        params["apikey"] = self.api_key
-
         canonical = self._canonical(path, params)
-        signature = self._sign(canonical)
-        params["signature"] = signature
+        signature = self._sign(method, canonical)
+
+        # Send params including signature + apikey
+        send_params = dict(params)
+        send_params["apikey"] = self.apikey
+        send_params["signature"] = signature
 
         url = f"{self.base_url}{path}"
 
-        # retries with backoff (helps Railway + 4over occasional blips)
+        # Light retry for transient 502/504/rate issues
         last_exc = None
-        for attempt in range(1, 5):
+        for attempt in range(3):
             try:
-                resp = self.session.request(method.upper(), url, params=params, timeout=timeout)
-                if resp.status_code in (429, 500, 502, 503, 504):
-                    # retry on transient errors
-                    time.sleep(0.6 * attempt)
+                resp = self._session.request(method.upper(), url, params=send_params, timeout=self._timeout)
+                if resp.status_code in (502, 503, 504):
+                    time.sleep(0.5 * (attempt + 1))
                     continue
                 resp.raise_for_status()
-                # 4over commonly returns JSON
-                ct = resp.headers.get("content-type", "")
-                if "application/json" in ct:
-                    return resp.json()
-                return {"raw": resp.text}
+                return resp.json()
             except Exception as e:
                 last_exc = e
-                time.sleep(0.6 * attempt)
+                time.sleep(0.5 * (attempt + 1))
 
-        raise last_exc  # type: ignore
+        raise last_exc
 
-    # Convenience methods
     def whoami(self):
-        return self.request("GET", "/whoami")
+        return self._request("GET", "/whoami")
 
-    def explore_path(self, path: str, offset: int = 0, per_page: int = 20):
-        # Many 4over endpoints respect offset/perPage; you confirmed enforced 20.
-        return self.request("GET", path, params={"offset": offset, "perPage": per_page})
+    def products(self, offset: int = 0, per_page: int = 200):
+        # 4over enforces perPage cap (often 20). We request high but honor returned count.
+        return self._request("GET", "/products", params={"offset": offset, "perPage": per_page})

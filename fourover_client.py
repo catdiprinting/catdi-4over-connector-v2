@@ -11,21 +11,19 @@ def _clean(s: str) -> str:
 
 class FourOverClient:
     """
-    Minimal 4over client.
+    Minimal 4over client (GET uses query-string auth).
 
     Railway env vars:
       FOUR_OVER_APIKEY
       FOUR_OVER_PRIVATE_KEY
       FOUR_OVER_BASE_URL (default: https://api.4over.com)
 
-    GET auth is query-string based:
-      ?apikey=...&signature=...&max=...&offset=...
-
-    Signature (matches 4over docs/email guidance style):
+    Signature per our working baseline:
       hmac_key = sha256(private_key).hexdigest()
       signature = HMAC_SHA256(hmac_key, HTTP_METHOD)
 
-    NOTE: private keys can be short (like X0PHN5KK). That's okay.
+    GET:
+      ?apikey=...&signature=...&max=...&offset=...
     """
 
     def __init__(self):
@@ -54,10 +52,9 @@ class FourOverClient:
         sig = self._signature("GET")
         merged = {"apikey": self.api_key, "signature": sig, **(params or {})}
 
-        # stable ordering for debugging
         qs = urlencode(sorted((k, str(v)) for k, v in merged.items() if v is not None))
-
         url = f"{self.base_url}{path}?{qs}"
+
         debug = {"method": "GET", "path": path, "signature": sig, "url": url, "params": merged}
         return url, debug
 

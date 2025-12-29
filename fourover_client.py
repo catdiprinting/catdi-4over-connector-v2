@@ -1,5 +1,4 @@
 import os
-import time
 import hashlib
 import hmac
 import requests
@@ -20,74 +19,33 @@ def build_canonical_path_and_query(path: str, query: dict) -> str:
     return f"{path}?{qs}" if qs else path
 
 
-def sign_4over_request(method: str, canonical_path_and_query: str, private_key: str) -> str:
+def sign_4over(method: str, canonical_path_and_query: str, private_key: str) -> str:
     pk = normalize_private_key(private_key)
     hmac_key = hashlib.sha256(pk.encode("utf-8")).hexdigest().encode("utf-8")
-    message = (method.upper() + canonical_path_and_query).encode("utf-8")
-    return hmac.new(hmac_key, message, hashlib.sha256).hexdigest()
+    msg = (method.upper() + canonical_path_and_query).encode("utf-8")
+    return hmac.new(hmac_key, msg, hashlib.sha256).hexdigest()
 
 
 class FourOverClient:
-    def __init__(
-        self,
-        base_url: str | None = None,
-        apikey: str | None = None,
-        private_key: str | None = None,
-        timeout_connect: float = 5.0,
-        timeout_read: float = 30.0,
-        max_retries: int = 3,
-        backoff_base: float = 0.6,
-    ):
-        self.base_url = (base_url or os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com")).rstrip("/")
-        self.apikey = apikey or os.getenv("FOUR_OVER_APIKEY", "")
-        self.private_key = private_key or os.getenv("FOUR_OVER_PRIVATE_KEY", "")
-        self.timeout = (timeout_connect, timeout_read)
-        self.max_retries = max_retries
-        self.backoff_base = backoff_base
+    def __init__(self):
+        self.base_url = (os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com") or "").rstrip("/")
+        self.apikey = os.getenv("FOUR_OVER_APIKEY", "") or ""
+        self.private_key = os.getenv("FOUR_OVER_PRIVATE_KEY", "") or ""
 
-        if not self.apikey or not self.private_key:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
+        if not self.base_url or not self.apikey or not self.private_key:
+            raise RuntimeError("Missing FOUR_OVER_BASE_URL / FOUR_OVER_APIKEY / FOUR_OVER_PRIVATE_KEY")
 
         self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json"})
+        self.timeout = (5, 25)
 
-    def _signed_params(self, method: str, path: str, params: dict | None):
+    def get(self, path: str, params: dict | None = None):
         params = dict(params or {})
         params["apikey"] = self.apikey
+
         canonical = build_canonical_path_and_query(path, params)
-        signature = sign_4over_request(method, canonical, self.private_key)
-        signed = dict(params)
-        signed["signature"] = signature
-        return signed, canonical, signature
+        sig = sign_4over("GET", canonical, self.private_key)
+        params["signature"] = sig
 
-    def request(self, method: str, path: str, params: dict | None = None):
-        method = method.upper()
-        signed_params, canonical, signature = self._signed_params(method, path, params)
         url = urljoin(self.base_url + "/", path.lstrip("/"))
-
-        last_exc = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                resp = self.session.request(
-                    method,
-                    url,
-                    params=signed_params,
-                    timeout=self.timeout,
-                )
-                if resp.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
-                    time.sleep(self.backoff_base * (2 ** (attempt - 1)))
-                    continue
-                return resp, {"url": url, "canonical": canonical, "signature": signature}
-            except requests.RequestException as e:
-                last_exc = e
-                if attempt < self.max_retries:
-                    time.sleep(self.backoff_base * (2 ** (attempt - 1)))
-                    continue
-                raise
-
-        raise last_exc or RuntimeError("Unknown request failure")
-
-    def debug_sign(self, method: str, path: str, params: dict | None = None):
-        method = method.upper()
-        signed_params, canonical, signature = self._signed_params(method, path, params)
-        return signed_params, canonical, signature
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        return resp, {"url": url, "canonical": canonical, "signature": sig}

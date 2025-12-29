@@ -1,11 +1,11 @@
 from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
+import traceback
 
 from models import CatalogItem
 
-
-PAGE_SIZE_ASSUMED = 20  # we observed API enforces 20 even if perPage requested is higher
+PAGE_SIZE_ASSUMED = 20  # API enforces 20 even if perPage requested is higher
 
 
 def get_catalog_count(db: Session) -> int:
@@ -26,17 +26,32 @@ def upsert_ids(db: Session, ids: List[str]) -> int:
 
 def pull_catalog_page(offset: int, per_page_requested: int = 200) -> Dict[str, Any]:
     """
-    Calls your existing fourover_client.py.
-    You said you already have fourover_client.py, so we don't rename it.
-    We import lazily to avoid crashing the whole app if env vars are missing.
+    Calls your existing fourover_client.py lazily so app boot doesn't crash.
     """
-    from fourover_client import FourOverClient  # MUST exist in your project
+    try:
+        from fourover_client import FourOverClient  # MUST exist
+    except Exception as e:
+        raise RuntimeError(
+            "Failed importing fourover_client.FourOverClient. "
+            "Your fourover_client.py may have a syntax/import/env issue."
+        ) from e
 
-    client = FourOverClient()
-    # Adjust this method name to match YOUR client if different:
-    # It should return a dict with fields including totalResults and items list.
-    # Common shape: {"totalResults":..., "items":[{"id":...}, ...]}
-    return client.get_catalog(offset=offset, per_page=per_page_requested)
+    try:
+        client = FourOverClient()
+    except Exception as e:
+        raise RuntimeError(
+            "FourOverClient() failed to initialize. "
+            "Likely missing env vars (API key/secret) or constructor crash."
+        ) from e
+
+    # IMPORTANT: adjust this method name if your client uses something else
+    try:
+        return client.get_catalog(offset=offset, per_page=per_page_requested)
+    except Exception as e:
+        raise RuntimeError(
+            "client.get_catalog() failed. This is inside your fourover_client call. "
+            "Check method name + request auth + response parsing."
+        ) from e
 
 
 def extract_ids(payload: Dict[str, Any]) -> List[str]:
@@ -58,6 +73,7 @@ def sync_catalog(db: Session, pages: int = 1, start_offset: int = 0) -> Dict[str
 
     for _ in range(pages):
         payload = pull_catalog_page(offset=offset, per_page_requested=200)
+
         if total_results is None:
             total_results = payload.get("totalResults") or payload.get("total_results") or 0
 
@@ -65,7 +81,6 @@ def sync_catalog(db: Session, pages: int = 1, start_offset: int = 0) -> Dict[str
         total_pulled += len(ids)
         total_upserted += upsert_ids(db, ids)
 
-        # move forward by enforced page size
         offset += PAGE_SIZE_ASSUMED
 
         if total_results and offset >= int(total_results):

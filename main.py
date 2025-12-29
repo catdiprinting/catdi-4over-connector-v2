@@ -1,9 +1,10 @@
 import os
+from collections import Counter
 from fastapi import FastAPI, HTTPException
 from fourover_client import FourOverClient
 from db import init_db
 
-app = FastAPI(title="Catdi 4over Connector", version="0.8.9")
+app = FastAPI(title="Catdi 4over Connector", version="0.9.0")
 
 
 def get_client() -> FourOverClient:
@@ -44,22 +45,19 @@ def _delta_params(lastupdate: str | None, time: str | None):
     return {"lastupdate": lastupdate, "time": time}
 
 
-def _cat_id(item: dict):
-    return item.get("category_uuid") or item.get("uuid") or item.get("id")
-
-
 def _safe_str(x):
     return (str(x) if x is not None else "").strip()
 
 
-def fetch_page_offset(client: FourOverClient, path: str, base_params: dict, offset: int, per_page: int):
+def fetch_productsfeed_page(client: FourOverClient, base_params: dict, offset: int, per_page: int, size_param: str):
     """
-    Fetch exactly ONE page using 4over's offset/perPage paging.
+    Fetch exactly one productsfeed page using offset + a chosen size param.
     """
     p = dict(base_params)
     p["offset"] = offset
-    p["perPage"] = per_page
-    resp = client.request("GET", path, params=p)
+    p[size_param] = per_page
+
+    resp = client.request("GET", "/printproducts/productsfeed", params=p)
     payload = resp.get("data", {})
     items = _normalize_list(payload)
 
@@ -69,78 +67,14 @@ def fetch_page_offset(client: FourOverClient, path: str, base_params: dict, offs
             "totalResults": payload.get("totalResults"),
             "maximumPages": payload.get("maximumPages"),
             "currentPage": payload.get("currentPage"),
-            "currentPageType": type(payload.get("currentPage")).__name__,
         }
 
-    return {
-        **resp,
-        "paging": {"offset": offset, "perPage": per_page},
-        "meta": meta,
-        "items_count": len(items),
-        "items_sample": items[:5],
-    }
-
-
-def fetch_all_categories_unique(client: FourOverClient, base_params: dict, per_page: int, max_pages: int = 50):
-    """
-    Pull all categories safely with offset stepping.
-    """
-    seen = {}
-    total_results = None
-    maximum_pages = None
-    pages_fetched = 0
-
-    for page in range(max_pages):
-        offset = page * per_page
-        out = fetch_page_offset(client, "/printproducts/categories", base_params, offset=offset, per_page=per_page)
-        payload = out.get("data", {})
-        items = _normalize_list(payload)
-
-        pages_fetched += 1
-
-        if isinstance(payload, dict):
-            if isinstance(payload.get("totalResults"), int):
-                total_results = payload.get("totalResults")
-            if isinstance(payload.get("maximumPages"), int):
-                maximum_pages = payload.get("maximumPages")
-
-        for c in items:
-            if not isinstance(c, dict):
-                continue
-            cid = _cat_id(c)
-            if cid and cid not in seen:
-                seen[cid] = c
-
-        if isinstance(total_results, int) and len(seen) >= total_results:
-            break
-
-        if not items:
-            break
-
-    return {
-        "ok": True,
-        "paging_param_used": "offset",
-        "page_size_param_used": "perPage",
-        "per_page": per_page,
-        "meta": {
-            "totalResults": total_results,
-            "maximumPages": maximum_pages,
-            "pages_fetched": pages_fetched,
-            "unique_count": len(seen),
-        },
-        "sample": list(seen.values())[:10],
-        "items": list(seen.values()),
-    }
+    return {"resp": resp, "payload": payload, "items": items, "meta": meta, "params_used": p}
 
 
 @app.on_event("startup")
 def startup():
     init_db()
-
-
-@app.get("/")
-def root():
-    return {"service": "catdi-4over-connector", "phase": "0.8.9", "build": "safe-productsfeed-enabled"}
 
 
 @app.get("/health")
@@ -150,92 +84,95 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"version": "0.8.9"}
+    return {"version": "0.9.0"}
 
 
-@app.get("/debug/config")
-def debug_config():
-    db_url = os.getenv("DATABASE_URL", "")
-    return {
-        "has_FOUR_OVER_APIKEY": bool(os.getenv("FOUR_OVER_APIKEY")),
-        "has_FOUR_OVER_PRIVATE_KEY": bool(os.getenv("FOUR_OVER_PRIVATE_KEY")),
-        "FOUR_OVER_BASE_URL": os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com"),
-        "db_url_present": bool(db_url),
-        "db_is_sqlite": db_url.startswith("sqlite"),
-        "db_scheme": (db_url.split(":", 1)[0] if db_url else None),
-    }
-
-
-@app.get("/4over/whoami")
-def fourover_whoami():
-    client = get_client()
-    return client.request("GET", "/whoami")
-
-
-# ✅ Categories (complete)
-@app.get("/4over/printproducts/categories/all")
-def categories_all(lastupdate: str | None = None, time: str | None = None, per_page: int = 20):
-    client = get_client()
-    params = _delta_params(lastupdate, time)
-    result = fetch_all_categories_unique(client, params, per_page=per_page, max_pages=50)
-
-    # return without the full items list to keep response light
-    return {
-        "ok": True,
-        "paging_param_used": result["paging_param_used"],
-        "page_size_param_used": result["page_size_param_used"],
-        "per_page": per_page,
-        "meta": result["meta"],
-        "sample": result["sample"],
-    }
-
-
-# ✅ Products feed: fetch ONE page only (safe)
-@app.get("/4over/printproducts/productsfeed/page")
-def productsfeed_page(
+@app.get("/4over/printproducts/productsfeed/inspect")
+def productsfeed_inspect(
     lastupdate: str | None = None,
     time: str | None = None,
     offset: int = 0,
-    per_page: int = 50,
+    per_page: int = 100,
 ):
+    """
+    Inspect how productsfeed responds to page-size params.
+    Tries both perPage and limit so we can see which one actually changes items_count.
+    """
     client = get_client()
     params = _delta_params(lastupdate, time)
-    return fetch_page_offset(client, "/printproducts/productsfeed", params, offset=offset, per_page=per_page)
+
+    a = fetch_productsfeed_page(client, params, offset=offset, per_page=per_page, size_param="perPage")
+    b = fetch_productsfeed_page(client, params, offset=offset, per_page=per_page, size_param="limit")
+
+    return {
+        "ok": True,
+        "request": {"offset": offset, "per_page_requested": per_page},
+        "perPage": {
+            "items_count": len(a["items"]),
+            "meta": a["meta"],
+            "first_product_sample": a["items"][:1],
+        },
+        "limit": {
+            "items_count": len(b["items"]),
+            "meta": b["meta"],
+            "first_product_sample": b["items"][:1],
+        },
+        "note": "Whichever returns the larger items_count (or changes behavior) is the page-size param we’ll use."
+    }
 
 
-# ✅ Products feed: keyword search (safe scan, limited pages)
-@app.get("/4over/printproducts/productsfeed/search")
-def productsfeed_search(
+@app.get("/4over/printproducts/productsfeed/search-smart")
+def productsfeed_search_smart(
     q: str,
     lastupdate: str | None = None,
     time: str | None = None,
     per_page: int = 100,
-    max_pages: int = 3,
+    max_pages: int = 10,
 ):
+    """
+    Smart search:
+    - auto-detect size param (perPage vs limit) based on which returns more items
+    - scan limited pages safely
+    - return hits + top category_name counts from scanned sample
+    """
     client = get_client()
     params = _delta_params(lastupdate, time)
+
+    # detect size param at offset 0
+    test_per = fetch_productsfeed_page(client, params, offset=0, per_page=per_page, size_param="perPage")
+    test_lim = fetch_productsfeed_page(client, params, offset=0, per_page=per_page, size_param="limit")
+    size_param = "perPage" if len(test_per["items"]) >= len(test_lim["items"]) else "limit"
 
     ql = q.lower().strip()
     hits = []
     scanned_items = 0
     pages_fetched = 0
     total_results = None
+    cat_counter = Counter()
 
     for page in range(max_pages):
-        offset = page * per_page
-        out = fetch_page_offset(client, "/printproducts/productsfeed", params, offset=offset, per_page=per_page)
-        payload = out.get("data", {})
-        items = _normalize_list(payload)
+        offset = page * (len(test_per["items"]) if size_param == "perPage" else len(test_lim["items"]) or per_page)
+        out = fetch_productsfeed_page(client, params, offset=offset, per_page=per_page, size_param=size_param)
+
+        payload = out["payload"]
+        items = out["items"]
+        meta = out["meta"]
 
         pages_fetched += 1
         scanned_items += len(items)
 
-        if isinstance(payload, dict) and isinstance(payload.get("totalResults"), int):
-            total_results = payload.get("totalResults")
+        if isinstance(meta.get("totalResults"), int):
+            total_results = meta["totalResults"]
 
         for p in items:
             if not isinstance(p, dict):
                 continue
+
+            # category names help us understand what the feed calls things
+            cat_name = _safe_str(p.get("category_name") or p.get("category") or "")
+            if cat_name:
+                cat_counter[cat_name] += 1
+
             hay = " ".join(
                 [
                     _safe_str(p.get("product_name")),
@@ -248,23 +185,25 @@ def productsfeed_search(
                     _safe_str(p.get("sku")),
                 ]
             ).lower()
+
             if ql in hay:
                 hits.append(p)
-                if len(hits) >= 25:  # cap to keep response light
+                if len(hits) >= 20:
                     break
 
-        if len(hits) >= 25:
+        if len(hits) >= 20:
             break
-
         if not items:
             break
 
     return {
         "ok": True,
         "q": q,
-        "scan": {"per_page": per_page, "max_pages": max_pages, "pages_fetched": pages_fetched, "scanned_items": scanned_items},
+        "size_param_used": size_param,
+        "scan": {"per_page_requested": per_page, "max_pages": max_pages, "pages_fetched": pages_fetched, "scanned_items": scanned_items},
         "feed_totalResults": total_results,
         "hits_count": len(hits),
         "hits_sample": hits[:10],
-        "note": "Increase max_pages if needed, but keep it small on Railway to avoid timeouts."
+        "top_category_names_in_sample": cat_counter.most_common(15),
+        "note": "If hits=0, use top_category_names_in_sample to identify correct terminology, then search those terms."
     }

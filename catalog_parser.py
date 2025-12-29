@@ -1,25 +1,36 @@
 import json
 
-def extract_catalog_fields(item: dict) -> dict:
+def parse_product_row(row: dict) -> dict:
     """
-    Pulls the known flattened fields you confirmed exist on /products.
-    Keeps raw JSON too.
+    Normalizes a single 4over /products item into fields we store.
+    Keeps raw_json for debugging and future parsing.
     """
-    def g(*keys):
+    def pick(*keys):
         for k in keys:
-            if k in item and item[k] is not None:
-                return item[k]
+            if k in row and row[k] not in (None, ""):
+                return row[k]
         return None
 
-    return {
-        "product_uuid": g("id", "uuid", "productid"),
-        "group_id": g("groupid"),
-        "group_name": g("groupname"),
-        "size_id": g("sizeid"),
-        "size_name": g("sizename"),
-        "stock_id": g("stockid"),
-        "stock_name": g("stockname"),
-        "coating_id": g("coatingid"),
-        "coating_name": g("coatingname"),
-        "raw_json": json.dumps(item, ensure_ascii=False),
+    product_id = pick("id", "productid", "uuid")
+    if not product_id:
+        # If 4over changes naming, fallback
+        product_id = row.get("product_uuid") or row.get("productId")
+
+    out = {
+        "id": str(product_id) if product_id else None,
+
+        "groupid": pick("groupid", "groupId"),
+        "groupname": pick("groupname", "groupName"),
+
+        "sizeid": pick("sizeid", "sizeId"),
+        "sizename": pick("sizename", "sizeName"),
+
+        "stockid": pick("stockid", "stockId"),
+        "stockname": pick("stockname", "stockName"),
+
+        "coatingid": pick("coatingid", "coatingId"),
+        "coatingname": pick("coatingname", "coatingName"),
+
+        "raw_json": json.dumps(row, ensure_ascii=False),
     }
+    return out

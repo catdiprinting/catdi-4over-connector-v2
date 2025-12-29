@@ -1,27 +1,29 @@
 import os
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-# Railway sometimes provides postgres:// which SQLAlchemy wants as postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-is_sqlite = DATABASE_URL.startswith("sqlite")
+# Force psycopg v3 driver
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
-# IMPORTANT:
-# Do NOT connect to DB at import time beyond engine creation.
-# Avoid create_all() on import; do it explicitly in an endpoint or startup with try/except.
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if is_sqlite else {},
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
     pool_pre_ping=True,
-    pool_recycle=1800,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+def db_ping() -> None:
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
 
 
 def get_db():

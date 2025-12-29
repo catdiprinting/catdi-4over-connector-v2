@@ -9,13 +9,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-# Normalize Railway-style URLs and force psycopg v3 driver for Postgres
+# Railway Postgres URLs sometimes start with postgres://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# Force SQLAlchemy to use psycopg (v3) instead of psycopg2
+# ✅ FORCE psycopg v3 driver (NOT psycopg2)
+# This prevents: psycopg2/_psycopg... undefined symbol: _PyInterpreterState_Get
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -32,15 +34,14 @@ Base = declarative_base()
 # -------------------
 # Catalog models (Phase 1: Groups only)
 # -------------------
-
 class CatalogGroup(Base):
     __tablename__ = "catalog_groups"
     id = Column(Integer, primary_key=True)
 
-    group_uuid = Column(String(64), nullable=False, unique=True)  # 4over groupid
-    group_name = Column(String(180), nullable=False)              # 4over groupname
-    sample_product_uuid = Column(String(64), nullable=True)       # optional
-    sample_product_name = Column(String(200), nullable=True)      # optional
+    group_uuid = Column(String(64), nullable=False, unique=True)   # 4over groupid
+    group_name = Column(String(180), nullable=False)               # 4over groupname
+    sample_product_uuid = Column(String(64), nullable=True)        # optional
+    sample_product_name = Column(String(200), nullable=True)       # optional
 
     __table_args__ = (
         Index("ix_catalog_groups_group_name", "group_name"),
@@ -50,9 +51,9 @@ class CatalogGroup(Base):
 # -------------------
 # Helpers
 # -------------------
-
 def init_db():
     Base.metadata.create_all(bind=engine)
+
 
 def get_db():
     db = SessionLocal()

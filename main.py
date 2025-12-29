@@ -5,7 +5,7 @@ from sqlalchemy import text
 
 from db import Base, engine, SessionLocal
 from models import FourOverProductsFeed
-from four_over_client import get_client_from_env
+from fourover_client import get_client_from_env
 
 
 app = FastAPI(title="catdi-4over-connector", version="0.8.0")

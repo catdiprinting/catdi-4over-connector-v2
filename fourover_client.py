@@ -5,48 +5,63 @@ import hashlib
 import requests
 from urllib.parse import urlencode
 
+
 class FourOverClient:
-    def __init__(self):
-        self.base_url = os.getenv("FOUROVER_BASE_URL", "https://api.4over.com").rstrip("/")
-        self.api_key = os.getenv("FOUROVER_API_KEY", "").strip()
-        self.private_key = os.getenv("FOUROVER_PRIVATE_KEY", "").strip()
+    def __init__(self, base_url: str = "https://api.4over.com"):
+        # Accept multiple env var names to avoid Railway mismatch
+        self.api_key = (
+            os.getenv("FOUROVER_API_KEY")
+            or os.getenv("FOUROVER_APIKEY")
+            or os.getenv("FOUROVER_KEY")
+            or os.getenv("FOUROVER_PUBLIC_KEY")
+            or os.getenv("FOUROVER_APIUSERNAME")
+        )
+
+        self.private_key = (
+            os.getenv("FOUROVER_PRIVATE_KEY")
+            or os.getenv("FOUROVER_SECRET_KEY")
+            or os.getenv("FOUROVER_SECRET")
+            or os.getenv("FOUROVER_PRIVATE")
+        )
 
         if not self.api_key or not self.private_key:
             raise RuntimeError("Missing FOUROVER_API_KEY or FOUROVER_PRIVATE_KEY in env vars")
 
-    def _signature(self, canonical: str) -> str:
-        # canonical like "/printproducts?offset=0&perPage=20"
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json"})
+
+    def _sign(self, canonical: str) -> str:
+        # 4over expects HMAC SHA256 hex digest
         return hmac.new(
             self.private_key.encode("utf-8"),
             canonical.encode("utf-8"),
-            hashlib.sha256
+            hashlib.sha256,
         ).hexdigest()
 
-    def _request(self, path: str, params: dict | None = None):
+    def _request(self, method: str, path: str, params: dict | None = None):
         params = params or {}
-        canonical = path
-        if params:
-            canonical = f"{path}?{urlencode(params)}"
+        # IMPORTANT: signature is calculated on canonical path + query (apikey included)
+        params_with_key = dict(params)
+        params_with_key["apikey"] = self.api_key
 
-        sig = self._signature(canonical)
-        url = f"{self.base_url}{canonical}"
-        headers = {"Accept": "application/json"}
+        query = urlencode(sorted(params_with_key.items()))
+        canonical = f"{path}?{query}" if query else path
+        signature = self._sign(canonical)
 
-        # 4over style auth (apikey + signature)
-        auth_params = {"apikey": self.api_key, "signature": sig}
-        joiner = "&" if "?" in url else "?"
-        url = f"{url}{joiner}{urlencode(auth_params)}"
+        url = f"{self.base_url}{path}"
+        final_params = dict(params_with_key)
+        final_params["signature"] = signature
 
-        r = requests.get(url, headers=headers, timeout=60)
-        r.raise_for_status()
-        return r.json()
+        resp = self.session.request(method, url, params=final_params, timeout=60)
+        resp.raise_for_status()
+        return resp.json()
 
-    def whoami(self):
-        return self._request("/whoami")
-
-    def list_printproducts(self, offset: int = 0, perPage: int = 20):
-        # Your tests showed perPage gets capped to 20
-        return self._request("/printproducts", {"offset": offset, "perPage": perPage})
-
-    def get_printproduct(self, item_id: str):
-        return self._request(f"/printproducts/{item_id}")
+    # ---- Adjust this endpoint path if your catalog endpoint differs ----
+    def get_catalog(self, offset: int = 0, per_page: int = 200):
+        # If API caps page size to 20, that's OK — your paging loop handles it.
+        return self._request(
+            "GET",
+            "/printproducts",
+            params={"offset": offset, "perPage": per_page},
+        )

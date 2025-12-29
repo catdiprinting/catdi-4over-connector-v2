@@ -271,3 +271,74 @@ def productsfeed_paging_test(
             "use_this_logic": "offset += enforced_page_size until offset >= totalResults"
         }
     }
+def _productsfeed_page(client, offset: int, lastupdate: str | None = None, time: str | None = None):
+    params = _delta_params(lastupdate, time)
+    params["offset"] = offset
+    params["perPage"] = 20  # hard cap confirmed
+
+    r = client.request("GET", "/printproducts/productsfeed", params=params)
+    data = r.get("data", {})
+    items = _normalize_list(data)
+
+    total = data.get("totalResults")
+    current = data.get("currentPage")  # appears to mirror offset
+    return items, total, current
+
+
+@app.get("/4over/printproducts/productsfeed/pull-pages")
+def productsfeed_pull_pages(
+    pages: int = 3,
+    start_offset: int = 0,
+    lastupdate: str | None = None,
+    time: str | None = None,
+):
+    """
+    Safe pull: fetch N pages of 20 items each and return IDs so we can verify.
+    Does NOT try to pull all 9,519 yet.
+    """
+    if pages < 1:
+        pages = 1
+    if pages > 50:
+        pages = 50  # safety cap
+
+    client = get_client()
+
+    pulled = 0
+    offset = start_offset
+    total_results = None
+    all_ids: list[str] = []
+
+    for _ in range(pages):
+        items, total, current = _productsfeed_page(client, offset, lastupdate, time)
+        if total_results is None:
+            total_results = total
+
+        # stop if nothing returned
+        if not items:
+            break
+
+        # collect a few ids (or all in these pages)
+        for it in items:
+            pid = it.get("product_uuid") or it.get("uuid") or it.get("id")
+            if pid:
+                all_ids.append(pid)
+
+        pulled += len(items)
+        offset += len(items)
+
+        # stop if we hit or passed total
+        if total_results is not None and offset >= int(total_results):
+            break
+
+    return {
+        "ok": True,
+        "requested_pages": pages,
+        "start_offset": start_offset,
+        "page_size_assumed": 20,
+        "pulled_items": pulled,
+        "end_offset": offset,
+        "totalResults": total_results,
+        "sample_first_10_ids": all_ids[:10],
+        "sample_last_10_ids": all_ids[-10:],
+        "verdict": "Looks good if pulled_items == pages*20 (unless near end) and IDs change."
+    }

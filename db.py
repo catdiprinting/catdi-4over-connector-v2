@@ -10,10 +10,14 @@ if DATABASE_URL.startswith("postgres://"):
 
 is_sqlite = DATABASE_URL.startswith("sqlite")
 
+# IMPORTANT:
+# Do NOT connect to DB at import time beyond engine creation.
+# Avoid create_all() on import; do it explicitly in an endpoint or startup with try/except.
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if is_sqlite else {},
     pool_pre_ping=True,
+    pool_recycle=1800,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

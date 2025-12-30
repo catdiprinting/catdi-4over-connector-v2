@@ -1,17 +1,12 @@
+# main.py
 from fastapi import FastAPI
-from sqlalchemy import text
-
-from db import Base, engine
 from doorhangers import router as doorhangers_router
+from db import engine, Base
 
-app = FastAPI(title="catdi-4over-connector", version="SAFE_AND_STABLE_2025-12-30_DOCS_REVERT")
+app = FastAPI(title="Catdi 4over Connector")
 
-# Create tables
+# Create tables safely
 Base.metadata.create_all(bind=engine)
-
-# Routers
-app.include_router(doorhangers_router)
-
 
 @app.get("/health")
 def health():
@@ -19,12 +14,8 @@ def health():
         "ok": True,
         "service": "catdi-4over-connector",
         "phase": "DOORHANGERS_PRICING_TESTER",
-        "build": "SAFE_AND_STABLE_2025-12-30_DOCS_REVERT",
+        "build": "STABLE_ROUTER_SPLIT"
     }
 
-
-@app.get("/db/ping")
-def db_ping():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"ok": True}
+# Include Doorhangers router
+app.include_router(doorhangers_router)

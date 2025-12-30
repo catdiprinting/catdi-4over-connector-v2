@@ -1,23 +1,28 @@
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import re
-from sqlalchemy import text
-from sqlalchemy.orm import Session
 
-from fourover_client import FourOverClient  # IMPORTANT: keep YOUR working version
-from db import get_db, db_ping, engine
+from sqlalchemy.orm import Session
+from sqlalchemy import text as sql_text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from fourover_client import FourOverClient
+
+from db import engine, Base, get_db, db_ping
 from models import Product, ProductOptionGroup, ProductOptionValue, ProductBasePrice
-from db import Base
+
 
 APP_NAME = "catdi-4over-connector"
 PHASE = "DOORHANGERS_PHASE1"
-BUILD = "PRICING_TESTER_DB_SYNC_TRUNCATE_2025-12-30"
+BUILD = "BASELINE_WHOAMI_WORKING_2025-12-30_FIX_DUPES"
 
-# Door Hangers category UUID
 DOORHANGERS_CATEGORY_UUID = "5cacc269-e6a8-472d-91d6-792c4584cae8"
 
 app = FastAPI(title=APP_NAME)
+
+# create tables if missing
+Base.metadata.create_all(bind=engine)
 
 _client: Optional[FourOverClient] = None
 
@@ -45,12 +50,6 @@ def _extract_size_from_desc(desc: str) -> Optional[str]:
     return f'{m.group(1)}" x {m.group(3)}"'
 
 
-@app.on_event("startup")
-def startup():
-    # Ensure tables exist (for tester mode)
-    Base.metadata.create_all(bind=engine)
-
-
 @app.get("/")
 def root():
     return {"service": APP_NAME, "phase": PHASE, "build": BUILD}
@@ -66,12 +65,11 @@ def version():
     return {"service": APP_NAME, "phase": PHASE, "build": BUILD}
 
 
-# ✅ FIX for your "Method Not Allowed": make db ping a GET route
 @app.get("/db/ping")
 def db_ping_route():
     try:
         db_ping()
-        return {"ok": True, "db": "reachable"}
+        return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -99,7 +97,11 @@ def categories(max: int = Query(1000, ge=1, le=5000), offset: int = Query(0, ge=
 
 
 @app.get("/4over/printproducts/categories/{category_uuid}/products")
-def category_products(category_uuid: str, max: int = Query(1000, ge=1, le=5000), offset: int = Query(0, ge=0)):
+def category_products(
+    category_uuid: str,
+    max: int = Query(1000, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
     try:
         path = f"/printproducts/categories/{category_uuid}/products"
         r, dbg = four_over().get(path, params={"max": max, "offset": offset})
@@ -111,7 +113,7 @@ def category_products(category_uuid: str, max: int = Query(1000, ge=1, le=5000),
 
 
 # ---------------------------
-# Door Hangers: API passthrough
+# Door Hangers: endpoints
 # ---------------------------
 
 @app.get("/doorhangers/products")
@@ -123,7 +125,7 @@ def doorhangers_products(max: int = Query(1000, ge=1, le=5000), offset: int = Qu
 def doorhangers_optiongroups(product_uuid: str):
     try:
         path = f"/printproducts/products/{product_uuid}/optiongroups"
-        r, dbg = four_over().get(path, params={"max": 1000, "offset": 0})
+        r, dbg = four_over().get(path, params={"max": 2000, "offset": 0})
         if not r.ok:
             return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
         return r.json()
@@ -144,184 +146,250 @@ def doorhangers_baseprices(product_uuid: str):
 
 
 # ---------------------------
-# ✅ SYNC: Door Hangers -> DB (Tester Mode)
-# No joins, no ORM query.delete/update. Uses TRUNCATE.
+# SYNC: Door Hangers → Postgres
 # ---------------------------
 
-def _truncate_tester_tables(db: Session):
-    # CASCADE handles FK relationships safely.
-    db.execute(text("TRUNCATE TABLE product_baseprices RESTART IDENTITY CASCADE"))
-    db.execute(text("TRUNCATE TABLE product_option_values RESTART IDENTITY CASCADE"))
-    db.execute(text("TRUNCATE TABLE product_option_groups RESTART IDENTITY CASCADE"))
-    db.execute(text("TRUNCATE TABLE products RESTART IDENTITY CASCADE"))
+def _entities(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, dict) and "entities" in payload and isinstance(payload["entities"], list):
+        return payload["entities"]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def _dedupe_by_key(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    seen = {}
+    for r in rows:
+        k = r.get(key)
+        if k and k not in seen:
+            seen[k] = r
+    return list(seen.values())
 
 
 @app.post("/sync/doorhangers")
 def sync_doorhangers(
-    max: int = Query(1000, ge=1, le=5000),
+    max: int = Query(25, ge=1, le=5000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     """
-    Pull Door Hangers product list + optiongroups + baseprices for each product,
-    store in Postgres for pricing tester UI.
+    Minimal tester sync:
+      - Pull Doorhanger products
+      - For each product: pull optiongroups + baseprices
+      - Store in Postgres
+
+    Safe to re-run: uses TRUNCATE + ON CONFLICT DO NOTHING + de-dupe.
     """
     try:
-        # 1) Fetch products list
-        data = category_products(DOORHANGERS_CATEGORY_UUID, max=max, offset=offset)
-        entities = data.get("entities", [])
-        if not isinstance(entities, list):
-            raise HTTPException(status_code=500, detail="Unexpected 4over products response (entities missing)")
+        # 1) pull product list
+        cat = category_products(DOORHANGERS_CATEGORY_UUID, max=max, offset=offset)
+        products = _entities(cat)
+        if not products:
+            return {"ok": True, "message": "No products returned from 4over", "synced_products": 0}
 
-        # 2) wipe tester tables (safe)
-        _truncate_tester_tables(db)
+        # 2) wipe tester tables (only these four)
+        db.execute(sql_text("TRUNCATE TABLE product_option_values RESTART IDENTITY CASCADE"))
+        db.execute(sql_text("TRUNCATE TABLE product_option_groups RESTART IDENTITY CASCADE"))
+        db.execute(sql_text("TRUNCATE TABLE product_baseprices RESTART IDENTITY CASCADE"))
+        db.execute(sql_text("TRUNCATE TABLE products RESTART IDENTITY CASCADE"))
+        db.commit()
 
-        # 3) Insert products
-        for p in entities:
-            db.add(
-                Product(
-                    product_uuid=p.get("product_uuid"),
-                    product_code=p.get("product_code"),
-                    product_description=p.get("product_description"),
-                    full_product_path=p.get("full_product_path"),
-                    categories_path=p.get("categories"),
-                    optiongroups_path=p.get("product_option_groups"),
-                    baseprices_path=p.get("product_base_prices"),
-                )
-            )
-        db.flush()
+        product_rows: List[Dict[str, Any]] = []
+        pog_rows: List[Dict[str, Any]] = []
+        pov_rows: List[Dict[str, Any]] = []
+        pbp_rows: List[Dict[str, Any]] = []
 
-        # 4) For each product: fetch optiongroups + baseprices and store
-        for p in entities:
-            product_uuid = p.get("product_uuid")
-            if not product_uuid:
+        # 3) build rows
+        for p in products:
+            puid = p.get("product_uuid")
+            if not puid:
                 continue
 
-            og = doorhangers_optiongroups(product_uuid)
-            og_entities = og.get("entities", []) if isinstance(og, dict) else []
+            product_rows.append(
+                {
+                    "product_uuid": puid,
+                    "product_code": p.get("product_code"),
+                    "product_description": p.get("product_description"),
+                    "categories_path": p.get("product_categories"),
+                    "optiongroups_path": p.get("product_option_groups"),
+                    "baseprices_path": p.get("product_base_prices"),
+                }
+            )
 
-            for group in og_entities:
-                group_uuid = group.get("product_option_group_uuid")
-                db.add(
-                    ProductOptionGroup(
-                        product_option_group_uuid=group_uuid,
-                        product_uuid=product_uuid,
-                        name=group.get("product_option_group_name"),
-                        minoccurs=str(group.get("minoccurs")) if group.get("minoccurs") is not None else None,
-                        maxoccurs=str(group.get("maxoccurs")) if group.get("maxoccurs") is not None else None,
-                    )
+            # optiongroups
+            og = doorhangers_optiongroups(puid)
+            og_items = _entities(og)
+
+            for g in og_items:
+                guid = g.get("product_option_group_uuid") or g.get("option_group_uuid") or g.get("uuid")
+                if not guid:
+                    continue
+
+                pog_rows.append(
+                    {
+                        "product_option_group_uuid": str(guid),
+                        "product_uuid": str(puid),
+                        "name": g.get("name"),
+                        "minoccurs": str(g.get("minoccurs") or ""),
+                        "maxoccurs": str(g.get("maxoccurs") or ""),
+                    }
                 )
 
-                options = group.get("options", []) or []
-                for opt in options:
-                    db.add(
-                        ProductOptionValue(
-                            option_uuid=opt.get("option_uuid"),
-                            product_uuid=product_uuid,
-                            product_option_group_uuid=group_uuid,
-                            option_name=opt.get("option_name"),
-                            option_description=opt.get("option_description"),
-                            option_prices=opt.get("option_prices"),
-                            runsize_uuid=opt.get("runsize_uuid"),
-                            runsize=opt.get("runsize"),
-                            colorspec_uuid=opt.get("colorspec_uuid"),
-                            colorspec=opt.get("colorspec"),
+                values = g.get("values") or g.get("options") or []
+                if isinstance(values, list):
+                    for v in values:
+                        vuid = v.get("product_option_value_uuid") or v.get("option_value_uuid") or v.get("uuid")
+                        if not vuid:
+                            continue
+                        pov_rows.append(
+                            {
+                                "product_option_value_uuid": str(vuid),
+                                "product_option_group_uuid": str(guid),
+                                "name": v.get("name"),
+                                "code": v.get("code"),
+                                "sort": v.get("sort") if isinstance(v.get("sort"), int) else None,
+                            }
                         )
-                    )
 
-            bp = doorhangers_baseprices(product_uuid)
-            bp_entities = bp.get("entities", []) if isinstance(bp, dict) else []
+            # baseprices
+            bp = doorhangers_baseprices(puid)
+            bp_items = _entities(bp)
 
-            for row in bp_entities:
-                db.add(
-                    ProductBasePrice(
-                        base_price_uuid=row.get("base_price_uuid"),
-                        product_uuid=product_uuid,
-                        product_baseprice=row.get("product_baseprice"),
-                        runsize_uuid=row.get("runsize_uuid"),
-                        runsize=row.get("runsize"),
-                        colorspec_uuid=row.get("colorspec_uuid"),
-                        colorspec=row.get("colorspec"),
-                        can_group_ship=row.get("can_group_ship"),
-                    )
+            for b in bp_items:
+                buid = b.get("product_baseprice_uuid") or b.get("uuid")
+                if not buid:
+                    continue
+                qty = b.get("quantity")
+                try:
+                    qty = int(qty) if qty is not None else None
+                except Exception:
+                    qty = None
+
+                price = b.get("price")
+                try:
+                    price = float(price) if price is not None else None
+                except Exception:
+                    price = None
+
+                pbp_rows.append(
+                    {
+                        "product_baseprice_uuid": str(buid),
+                        "product_uuid": str(puid),
+                        "quantity": qty,
+                        "turnaround": b.get("turnaround") or b.get("turn_around_time") or b.get("tat"),
+                        "price": price,
+                    }
                 )
+
+        # 4) de-dupe (THIS is what fixes your crash)
+        product_rows = _dedupe_by_key(product_rows, "product_uuid")
+        pog_rows = _dedupe_by_key(pog_rows, "product_option_group_uuid")
+        pov_rows = _dedupe_by_key(pov_rows, "product_option_value_uuid")
+        pbp_rows = _dedupe_by_key(pbp_rows, "product_baseprice_uuid")
+
+        # 5) upsert-safe bulk inserts
+        if product_rows:
+            stmt = pg_insert(Product.__table__).values(product_rows)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["product_uuid"])
+            db.execute(stmt)
+
+        if pog_rows:
+            stmt = pg_insert(ProductOptionGroup.__table__).values(pog_rows)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["product_option_group_uuid"])
+            db.execute(stmt)
+
+        if pov_rows:
+            stmt = pg_insert(ProductOptionValue.__table__).values(pov_rows)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["product_option_value_uuid"])
+            db.execute(stmt)
+
+        if pbp_rows:
+            stmt = pg_insert(ProductBasePrice.__table__).values(pbp_rows)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["product_baseprice_uuid"])
+            db.execute(stmt)
 
         db.commit()
 
         return {
             "ok": True,
-            "synced_products": len(entities),
-            "note": "Tester sync complete. Use /doorhangers/tester to browse options + prices from DB.",
+            "synced_products": len(product_rows),
+            "option_groups": len(pog_rows),
+            "option_values": len(pov_rows),
+            "baseprices": len(pbp_rows),
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------
-# ✅ Pricing Tester Endpoint (DB-backed)
+# Tester endpoints (DB-backed)
 # ---------------------------
 
 @app.get("/doorhangers/tester")
-def doorhangers_tester(
-    product_uuid: Optional[str] = None,
-    db: Session = Depends(get_db),
-):
+def doorhangers_tester(product_uuid: Optional[str] = None, db: Session = Depends(get_db)):
     """
-    If product_uuid is not provided: returns a list of products (uuid, code, desc, size_hint)
-    If product_uuid is provided: returns option groups + options + baseprices from DB
+    If no product_uuid: returns product list.
+    If product_uuid: returns option groups + values + baseprices for dropdown testing.
     """
     if not product_uuid:
-        prods = db.query(Product).order_by(Product.product_code.asc().nulls_last()).all()
-        out = []
-        for p in prods:
-            out.append(
+        items = db.query(Product).order_by(Product.product_code.asc().nulls_last()).limit(200).all()
+        return {
+            "count": len(items),
+            "products": [
                 {
                     "product_uuid": p.product_uuid,
                     "product_code": p.product_code,
                     "product_description": p.product_description,
-                    "size_hint": _extract_size_from_desc(p.product_description or ""),
                 }
-            )
-        return {"count": len(out), "products": out}
+                for p in items
+            ],
+        }
 
-    p = db.query(Product).filter(Product.product_uuid == product_uuid).first()
+    p = db.get(Product, product_uuid)
     if not p:
         raise HTTPException(status_code=404, detail="product_uuid not found in DB. Run /sync/doorhangers first.")
 
-    groups = db.query(ProductOptionGroup).filter(ProductOptionGroup.product_uuid == product_uuid).all()
-    options = db.query(ProductOptionValue).filter(ProductOptionValue.product_uuid == product_uuid).all()
-    prices = db.query(ProductBasePrice).filter(ProductBasePrice.product_uuid == product_uuid).all()
+    groups = (
+        db.query(ProductOptionGroup)
+        .filter(ProductOptionGroup.product_uuid == product_uuid)
+        .order_by(ProductOptionGroup.name.asc().nulls_last())
+        .all()
+    )
 
-    # build group->options map
-    group_map: Dict[str, Any] = {}
+    out_groups = []
     for g in groups:
-        group_map[g.product_option_group_uuid] = {
-            "group_uuid": g.product_option_group_uuid,
-            "name": g.name,
-            "minoccurs": g.minoccurs,
-            "maxoccurs": g.maxoccurs,
-            "options": [],
-        }
-
-    for o in options:
-        g = group_map.get(o.product_option_group_uuid)
-        if not g:
-            # if a row has no group uuid, ignore in tester
-            continue
-        g["options"].append(
+        vals = (
+            db.query(ProductOptionValue)
+            .filter(ProductOptionValue.product_option_group_uuid == g.product_option_group_uuid)
+            .order_by(ProductOptionValue.sort.asc().nulls_last(), ProductOptionValue.name.asc().nulls_last())
+            .all()
+        )
+        out_groups.append(
             {
-                "option_uuid": o.option_uuid,
-                "option_name": o.option_name,
-                "option_description": o.option_description,
-                "runsize": o.runsize,
-                "colorspec": o.colorspec,
-                "option_prices": o.option_prices,
+                "product_option_group_uuid": g.product_option_group_uuid,
+                "name": g.name,
+                "minoccurs": g.minoccurs,
+                "maxoccurs": g.maxoccurs,
+                "values": [
+                    {
+                        "product_option_value_uuid": v.product_option_value_uuid,
+                        "name": v.name,
+                        "code": v.code,
+                        "sort": v.sort,
+                    }
+                    for v in vals
+                ],
             }
         )
+
+    prices = (
+        db.query(ProductBasePrice)
+        .filter(ProductBasePrice.product_uuid == product_uuid)
+        .order_by(ProductBasePrice.quantity.asc().nulls_last())
+        .all()
+    )
 
     return {
         "product": {
@@ -329,15 +397,15 @@ def doorhangers_tester(
             "product_code": p.product_code,
             "product_description": p.product_description,
         },
-        "option_groups": list(group_map.values()),
+        "option_groups": out_groups,
         "baseprices": [
             {
-                "base_price_uuid": r.base_price_uuid,
-                "runsize": r.runsize,
-                "colorspec": r.colorspec,
-                "product_baseprice": str(r.product_baseprice) if r.product_baseprice is not None else None,
+                "product_baseprice_uuid": bp.product_baseprice_uuid,
+                "quantity": bp.quantity,
+                "turnaround": bp.turnaround,
+                "price": float(bp.price) if bp.price is not None else None,
             }
-            for r in prices
+            for bp in prices
         ],
     }
 
@@ -349,9 +417,10 @@ def doorhangers_help():
         "tests": {
             "whoami": f"{base}/4over/whoami",
             "db_ping": f"{base}/db/ping",
-            "sync_doorhangers": f"curl -i -X POST \"{base}/sync/doorhangers?max=1000&offset=0\"",
-            "tester_list_products": f"{base}/doorhangers/tester",
-            "tester_single_product": f"{base}/doorhangers/tester?product_uuid=<PRODUCT_UUID>",
+            "sync_25": f"{base}/sync/doorhangers?max=25&offset=0",
+            "tester_list": f"{base}/doorhangers/tester",
+            "tester_one": f"{base}/doorhangers/tester?product_uuid=<PRODUCT_UUID>",
         },
         "doorhangers_category_uuid": DOORHANGERS_CATEGORY_UUID,
+        "note": "Run sync_25 first, then tester_list to pick a product_uuid.",
     }

@@ -1,15 +1,4 @@
-# models.py
-from sqlalchemy import (
-    Column,
-    String,
-    Text,
-    Integer,
-    Numeric,
-    Boolean,
-    ForeignKey,
-    UniqueConstraint,
-    Index,
-)
+from sqlalchemy import Column, String, Text, Numeric, Boolean, Index, ForeignKey
 from sqlalchemy.orm import relationship
 from db import Base
 
@@ -18,80 +7,72 @@ class Product(Base):
     __tablename__ = "products"
 
     product_uuid = Column(String, primary_key=True, index=True)
-    product_code = Column(String, index=True)
-    product_description = Column(Text)
+    product_code = Column(String, index=True, nullable=True)
+    product_description = Column(Text, nullable=True)
 
-    full_product_path = Column(Text)
-    categories_path = Column(Text)
-    optiongroups_path = Column(Text)
-    baseprices_path = Column(Text)
+    full_product_path = Column(Text, nullable=True)
+    categories_path = Column(Text, nullable=True)
+    optiongroups_path = Column(Text, nullable=True)
+    baseprices_path = Column(Text, nullable=True)
 
-    option_groups = relationship("OptionGroup", back_populates="product", cascade="all, delete-orphan")
-    base_prices = relationship("BasePrice", back_populates="product", cascade="all, delete-orphan")
+    option_groups = relationship("ProductOptionGroup", cascade="all, delete-orphan", back_populates="product")
+    option_values = relationship("ProductOptionValue", cascade="all, delete-orphan", back_populates="product")
+    baseprices = relationship("ProductBasePrice", cascade="all, delete-orphan", back_populates="product")
 
 
-class OptionGroup(Base):
-    __tablename__ = "option_groups"
+class ProductOptionGroup(Base):
+    __tablename__ = "product_option_groups"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    product_uuid = Column(String, ForeignKey("products.product_uuid", ondelete="CASCADE"), index=True)
+    product_option_group_uuid = Column(String, primary_key=True, index=True)
+    product_uuid = Column(String, ForeignKey("products.product_uuid", ondelete="CASCADE"), index=True, nullable=False)
 
-    group_uuid = Column(String, index=True)
-    group_name = Column(String, index=True)
+    name = Column(String, nullable=True)
     minoccurs = Column(String, nullable=True)
     maxoccurs = Column(String, nullable=True)
 
     product = relationship("Product", back_populates="option_groups")
-    options = relationship("Option", back_populates="group", cascade="all, delete-orphan")
 
-    __table_args__ = (
-        UniqueConstraint("product_uuid", "group_uuid", name="uq_product_group"),
-    )
+Index("ix_pog_product_uuid", ProductOptionGroup.product_uuid)
 
 
-class Option(Base):
-    __tablename__ = "options"
+class ProductOptionValue(Base):
+    __tablename__ = "product_option_values"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    option_group_id = Column(Integer, ForeignKey("option_groups.id", ondelete="CASCADE"), index=True)
+    option_uuid = Column(String, primary_key=True, index=True)
+    product_uuid = Column(String, ForeignKey("products.product_uuid", ondelete="CASCADE"), index=True, nullable=False)
+    product_option_group_uuid = Column(String, index=True, nullable=True)
 
-    option_uuid = Column(String, index=True)
-    option_name = Column(String)
+    option_name = Column(String, nullable=True)
     option_description = Column(Text, nullable=True)
-    capi_name = Column(String, nullable=True)
-    capi_description = Column(Text, nullable=True)
+    option_prices = Column(Text, nullable=True)
 
-    # Some groups (like Turn Around Time) include these:
+    # helpful for turnaround-time rows
     runsize_uuid = Column(String, nullable=True)
     runsize = Column(String, nullable=True)
     colorspec_uuid = Column(String, nullable=True)
     colorspec = Column(String, nullable=True)
 
-    option_prices_path = Column(Text, nullable=True)
+    product = relationship("Product", back_populates="option_values")
 
-    group = relationship("OptionGroup", back_populates="options")
-
-    __table_args__ = (
-        UniqueConstraint("option_group_id", "option_uuid", name="uq_group_option"),
-    )
+Index("ix_pov_product_uuid", ProductOptionValue.product_uuid)
+Index("ix_pov_group_uuid", ProductOptionValue.product_option_group_uuid)
 
 
-class BasePrice(Base):
-    __tablename__ = "base_prices"
+class ProductBasePrice(Base):
+    __tablename__ = "product_baseprices"
 
     base_price_uuid = Column(String, primary_key=True, index=True)
-    product_uuid = Column(String, ForeignKey("products.product_uuid", ondelete="CASCADE"), index=True)
+    product_uuid = Column(String, ForeignKey("products.product_uuid", ondelete="CASCADE"), index=True, nullable=False)
 
-    product_baseprice = Column(Numeric(18, 6))  # keep precision
-    can_group_ship = Column(Boolean, default=False)
+    product_baseprice = Column(Numeric(18, 6), nullable=True)
 
-    runsize_uuid = Column(String, index=True)
-    runsize = Column(String, index=True)
+    runsize_uuid = Column(String, nullable=True)
+    runsize = Column(String, nullable=True)
+    colorspec_uuid = Column(String, nullable=True)
+    colorspec = Column(String, nullable=True)
 
-    colorspec_uuid = Column(String, index=True)
-    colorspec = Column(String, index=True)
+    can_group_ship = Column(Boolean, nullable=True)
 
-    product = relationship("Product", back_populates="base_prices")
+    product = relationship("Product", back_populates="baseprices")
 
-
-Index("idx_baseprice_lookup", BasePrice.product_uuid, BasePrice.runsize_uuid, BasePrice.colorspec_uuid)
+Index("ix_pbp_product_uuid", ProductBasePrice.product_uuid)

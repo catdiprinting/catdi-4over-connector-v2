@@ -1,49 +1,50 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, Request
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse
 from typing import Any, Dict, List, Optional
-import re
 import os
+import re
 import traceback
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sql_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import inspect
 
 from fourover_client import FourOverClient
-
 from db import engine, Base, get_db, db_ping
 from models import Product, ProductOptionGroup, ProductOptionValue, ProductBasePrice
 
-
 APP_NAME = "catdi-4over-connector"
 PHASE = "DOORHANGERS_PHASE1"
-BUILD = "BASELINE_WHOAMI_WORKING_2025-12-30_FIX_DUPES"
+BUILD = "BASELINE_WHOAMI_WORKING_2025-12-30_SCHEMA_GUARD"
 
 DOORHANGERS_CATEGORY_UUID = "5cacc269-e6a8-472d-91d6-792c4584cae8"
 
 app = FastAPI(title=APP_NAME)
 
+_client: Optional[FourOverClient] = None
+
+
 # ---------------------------
-# Global error handler (so 500s show real reason)
-# Set Railway var: DEBUG_ERRORS=1 to include stack trace
+# Debug JSON error handler
 # ---------------------------
 DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") == "1"
 
-
 @app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    payload = {"ok": False, "error": str(exc)}
+async def all_exception_handler(request, exc: Exception):
+    # If DEBUG_ERRORS=1, return stack trace to help you fix fast
     if DEBUG_ERRORS:
-        payload["trace"] = traceback.format_exc()[:4000]
-        payload["path"] = str(request.url)
-        payload["method"] = request.method
-    return JSONResponse(status_code=500, content=payload)
-
-
-# create tables if missing
-Base.metadata.create_all(bind=engine)
-
-_client: Optional[FourOverClient] = None
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": str(exc),
+                "trace": traceback.format_exc(),
+                "path": str(request.url),
+            },
+        )
+    # Otherwise keep it simple
+    return JSONResponse(status_code=500, content={"ok": False, "error": "Internal Server Error"})
 
 
 def four_over() -> FourOverClient:
@@ -68,6 +69,92 @@ def _extract_size_from_desc(desc: str) -> Optional[str]:
         return None
     return f'{m.group(1)}" x {m.group(3)}"'
 
+
+# ---------------------------
+# Schema guard (tester tables only)
+# ---------------------------
+
+TESTER_TABLES = [
+    "product_option_values",
+    "product_option_groups",
+    "product_baseprices",
+    "products",
+]
+
+REQUIRED_COLUMNS = {
+    "products": {"product_uuid", "product_code", "product_description", "categories_path", "optiongroups_path", "baseprices_path"},
+    "product_option_groups": {"product_option_group_uuid", "product_uuid", "name", "minoccurs", "maxoccurs"},
+    "product_option_values": {"product_option_value_uuid", "product_option_group_uuid", "name", "code", "sort"},
+    "product_baseprices": {"product_baseprice_uuid", "product_uuid", "quantity", "turnaround", "price"},
+}
+
+
+def _get_table_columns(table_name: str) -> set[str]:
+    insp = inspect(engine)
+    if table_name not in insp.get_table_names():
+        return set()
+    cols = insp.get_columns(table_name)
+    return {c["name"] for c in cols}
+
+
+def _tester_schema_is_ok() -> bool:
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+
+    # If any tester table missing, schema is not OK (we’ll create)
+    for t in TESTER_TABLES:
+        if t not in existing_tables:
+            return False
+
+    # If any required column missing, schema is not OK
+    for t, required in REQUIRED_COLUMNS.items():
+        cols = _get_table_columns(t)
+        if not required.issubset(cols):
+            return False
+
+    return True
+
+
+def _reset_tester_schema_sql():
+    """
+    Drops ONLY the tester tables and recreates them from SQLAlchemy models.
+    This is safe because these are your "tester" sync tables.
+    """
+    with engine.begin() as conn:
+        # Drop in dependency order
+        conn.execute(sql_text("DROP TABLE IF EXISTS product_option_values CASCADE"))
+        conn.execute(sql_text("DROP TABLE IF EXISTS product_option_groups CASCADE"))
+        conn.execute(sql_text("DROP TABLE IF EXISTS product_baseprices CASCADE"))
+        conn.execute(sql_text("DROP TABLE IF EXISTS products CASCADE"))
+
+    # Recreate
+    Base.metadata.create_all(bind=engine)
+
+
+# Run schema guard on startup
+@app.on_event("startup")
+def startup_schema_guard():
+    # Create tables if missing (first time)
+    Base.metadata.create_all(bind=engine)
+
+    # If schema mismatch, reset ONLY tester schema
+    if not _tester_schema_is_ok():
+        _reset_tester_schema_sql()
+
+
+@app.post("/db/reset_tester_schema")
+def reset_tester_schema():
+    """
+    Manual reset button if you ever want to force it.
+    Drops ONLY tester tables and recreates from models.
+    """
+    _reset_tester_schema_sql()
+    return {"ok": True, "message": "Tester schema reset (products, option groups, option values, baseprices)."}
+
+
+# ---------------------------
+# Core routes
+# ---------------------------
 
 @app.get("/")
 def root():
@@ -95,24 +182,18 @@ def db_ping_route():
 
 @app.get("/4over/whoami")
 def whoami():
-    try:
-        r, _dbg = four_over().get("/whoami", params={})
-        if not r.ok:
-            return JSONResponse(status_code=r.status_code, content=_json_or_text(r))
-        return r.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    r, _dbg = four_over().get("/whoami", params={})
+    if not r.ok:
+        return JSONResponse(status_code=r.status_code, content=_json_or_text(r))
+    return r.json()
 
 
 @app.get("/4over/printproducts/categories")
 def categories(max: int = Query(1000, ge=1, le=5000), offset: int = Query(0, ge=0)):
-    try:
-        r, dbg = four_over().get("/printproducts/categories", params={"max": max, "offset": offset})
-        if not r.ok:
-            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
-        return r.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    r, dbg = four_over().get("/printproducts/categories", params={"max": max, "offset": offset})
+    if not r.ok:
+        return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+    return r.json()
 
 
 @app.get("/4over/printproducts/categories/{category_uuid}/products")
@@ -121,14 +202,11 @@ def category_products(
     max: int = Query(1000, ge=1, le=5000),
     offset: int = Query(0, ge=0),
 ):
-    try:
-        path = f"/printproducts/categories/{category_uuid}/products"
-        r, dbg = four_over().get(path, params={"max": max, "offset": offset})
-        if not r.ok:
-            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
-        return r.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    path = f"/printproducts/categories/{category_uuid}/products"
+    r, dbg = four_over().get(path, params={"max": max, "offset": offset})
+    if not r.ok:
+        return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+    return r.json()
 
 
 # ---------------------------
@@ -142,26 +220,20 @@ def doorhangers_products(max: int = Query(1000, ge=1, le=5000), offset: int = Qu
 
 @app.get("/doorhangers/product/{product_uuid}/optiongroups")
 def doorhangers_optiongroups(product_uuid: str):
-    try:
-        path = f"/printproducts/products/{product_uuid}/optiongroups"
-        r, dbg = four_over().get(path, params={"max": 2000, "offset": 0})
-        if not r.ok:
-            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
-        return r.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    path = f"/printproducts/products/{product_uuid}/optiongroups"
+    r, dbg = four_over().get(path, params={"max": 2000, "offset": 0})
+    if not r.ok:
+        return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+    return r.json()
 
 
 @app.get("/doorhangers/product/{product_uuid}/baseprices")
 def doorhangers_baseprices(product_uuid: str):
-    try:
-        path = f"/printproducts/products/{product_uuid}/baseprices"
-        r, dbg = four_over().get(path, params={"max": 5000, "offset": 0})
-        if not r.ok:
-            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
-        return r.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    path = f"/printproducts/products/{product_uuid}/baseprices"
+    r, dbg = four_over().get(path, params={"max": 5000, "offset": 0})
+    if not r.ok:
+        return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+    return r.json()
 
 
 # ---------------------------
@@ -192,21 +264,22 @@ def sync_doorhangers(
     db: Session = Depends(get_db),
 ):
     """
-    Minimal tester sync:
+    Minimal tester sync (safe to re-run):
       - Pull Doorhanger products
-      - For each product: pull optiongroups + baseprices
+      - Pull optiongroups + baseprices per product
       - Store in Postgres
-
-    Safe to re-run: uses TRUNCATE + ON CONFLICT DO NOTHING + de-dupe.
     """
     try:
-        # 1) pull product list
+        # Ensure tester schema is correct before sync
+        if not _tester_schema_is_ok():
+            _reset_tester_schema_sql()
+
         cat = category_products(DOORHANGERS_CATEGORY_UUID, max=max, offset=offset)
         products = _entities(cat)
         if not products:
             return {"ok": True, "message": "No products returned from 4over", "synced_products": 0}
 
-        # 2) wipe tester tables (only these four)
+        # wipe tester tables (only these four)
         db.execute(sql_text("TRUNCATE TABLE product_option_values RESTART IDENTITY CASCADE"))
         db.execute(sql_text("TRUNCATE TABLE product_option_groups RESTART IDENTITY CASCADE"))
         db.execute(sql_text("TRUNCATE TABLE product_baseprices RESTART IDENTITY CASCADE"))
@@ -218,7 +291,6 @@ def sync_doorhangers(
         pov_rows: List[Dict[str, Any]] = []
         pbp_rows: List[Dict[str, Any]] = []
 
-        # 3) build rows
         for p in products:
             puid = p.get("product_uuid")
             if not puid:
@@ -226,7 +298,7 @@ def sync_doorhangers(
 
             product_rows.append(
                 {
-                    "product_uuid": puid,
+                    "product_uuid": str(puid),
                     "product_code": p.get("product_code"),
                     "product_description": p.get("product_description"),
                     "categories_path": p.get("product_categories"),
@@ -235,8 +307,7 @@ def sync_doorhangers(
                 }
             )
 
-            # optiongroups
-            og = doorhangers_optiongroups(puid)
+            og = doorhangers_optiongroups(str(puid))
             og_items = _entities(og)
 
             for g in og_items:
@@ -270,14 +341,14 @@ def sync_doorhangers(
                             }
                         )
 
-            # baseprices
-            bp = doorhangers_baseprices(puid)
+            bp = doorhangers_baseprices(str(puid))
             bp_items = _entities(bp)
 
             for b in bp_items:
                 buid = b.get("product_baseprice_uuid") or b.get("uuid")
                 if not buid:
                     continue
+
                 qty = b.get("quantity")
                 try:
                     qty = int(qty) if qty is not None else None
@@ -300,13 +371,11 @@ def sync_doorhangers(
                     }
                 )
 
-        # 4) de-dupe (THIS is what fixes your crash)
         product_rows = _dedupe_by_key(product_rows, "product_uuid")
         pog_rows = _dedupe_by_key(pog_rows, "product_option_group_uuid")
         pov_rows = _dedupe_by_key(pov_rows, "product_option_value_uuid")
         pbp_rows = _dedupe_by_key(pbp_rows, "product_baseprice_uuid")
 
-        # 5) upsert-safe bulk inserts
         if product_rows:
             stmt = pg_insert(Product.__table__).values(product_rows)
             stmt = stmt.on_conflict_do_nothing(index_elements=["product_uuid"])
@@ -348,10 +417,6 @@ def sync_doorhangers(
 
 @app.get("/doorhangers/tester")
 def doorhangers_tester(product_uuid: Optional[str] = None, db: Session = Depends(get_db)):
-    """
-    If no product_uuid: returns product list.
-    If product_uuid: returns option groups + values + baseprices for dropdown testing.
-    """
     if not product_uuid:
         items = db.query(Product).order_by(Product.product_code.asc().nulls_last()).limit(200).all()
         return {
@@ -436,10 +501,11 @@ def doorhangers_help():
         "tests": {
             "whoami": f"{base}/4over/whoami",
             "db_ping": f"{base}/db/ping",
+            "reset_schema": f"{base}/db/reset_tester_schema",
             "sync_25": f"{base}/sync/doorhangers?max=25&offset=0",
             "tester_list": f"{base}/doorhangers/tester",
             "tester_one": f"{base}/doorhangers/tester?product_uuid=<PRODUCT_UUID>",
         },
         "doorhangers_category_uuid": DOORHANGERS_CATEGORY_UUID,
-        "note": "Run sync_25 first, then tester_list to pick a product_uuid.",
+        "note": "If tester_one errors, run POST reset_schema, then POST sync_25 again.",
     }

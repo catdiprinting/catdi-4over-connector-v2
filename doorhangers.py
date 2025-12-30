@@ -1,7 +1,9 @@
 # doorhangers.py
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
+import os
+import traceback
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -14,6 +16,8 @@ from models import Product, ProductOptionGroup, ProductOptionValue, ProductBaseP
 DOORHANGERS_CATEGORY_UUID = "5cacc269-e6a8-472d-91d6-792c4584cae8"
 
 router = APIRouter(prefix="/doorhangers", tags=["doorhangers"])
+
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") == "1"
 
 _client: Optional[FourOverClient] = None
 
@@ -49,41 +53,87 @@ def _dedupe_by_key(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]
     return list(seen.values())
 
 
+@router.get("/_debug/products")
+def debug_products(max: int = Query(5, ge=1, le=5000), offset: int = Query(0, ge=0)):
+    """
+    Debug endpoint: shows upstream status + debug + a snippet of response.
+    Use this anytime /doorhangers/products errors.
+    """
+    try:
+        path = f"/printproducts/categories/{DOORHANGERS_CATEGORY_UUID}/products"
+        r, dbg = four_over().get(path, params={"max": max, "offset": offset})
+        return {
+            "ok": True,
+            "upstream_ok": bool(getattr(r, "ok", False)),
+            "status_code": getattr(r, "status_code", None),
+            "debug": dbg,
+            "body": _json_or_text(r),
+        }
+    except Exception as e:
+        payload = {"ok": False, "error": str(e)}
+        if DEBUG_ERRORS:
+            payload["trace"] = traceback.format_exc()
+        return JSONResponse(status_code=500, content=payload)
+
+
 @router.get("/products")
 def doorhangers_products(max: int = Query(1000, ge=1, le=5000), offset: int = Query(0, ge=0)):
-    path = f"/printproducts/categories/{DOORHANGERS_CATEGORY_UUID}/products"
-    r, dbg = four_over().get(path, params={"max": max, "offset": offset})
-    if not r.ok:
-        return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+    """
+    Returns Doorhangers products directly from 4over category endpoint.
+    """
+    try:
+        path = f"/printproducts/categories/{DOORHANGERS_CATEGORY_UUID}/products"
+        r, dbg = four_over().get(path, params={"max": max, "offset": offset})
 
-    data = r.json()
-    items = _entities(data)
-    return {"count": len(items), "products": items}
+        if not r.ok:
+            return JSONResponse(
+                status_code=r.status_code,
+                content={"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg},
+            )
+
+        data = r.json()
+        items = _entities(data)
+        return {"ok": True, "count": len(items), "products": items}
+
+    except Exception as e:
+        payload = {"ok": False, "error": str(e)}
+        if DEBUG_ERRORS:
+            payload["trace"] = traceback.format_exc()
+        return JSONResponse(status_code=500, content=payload)
 
 
 @router.get("/product/{product_uuid}/optiongroups")
 def optiongroups(product_uuid: str):
-    path = f"/printproducts/products/{product_uuid}/optiongroups"
-    r, dbg = four_over().get(path, params={"max": 5000, "offset": 0})
-    if not r.ok:
-        return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
-    return r.json()
+    try:
+        path = f"/printproducts/products/{product_uuid}/optiongroups"
+        r, dbg = four_over().get(path, params={"max": 5000, "offset": 0})
+        if not r.ok:
+            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+        return r.json()
+    except Exception as e:
+        payload = {"ok": False, "error": str(e)}
+        if DEBUG_ERRORS:
+            payload["trace"] = traceback.format_exc()
+        return JSONResponse(status_code=500, content=payload)
 
 
 @router.get("/product/{product_uuid}/baseprices")
 def baseprices(product_uuid: str):
-    path = f"/printproducts/products/{product_uuid}/baseprices"
-    r, dbg = four_over().get(path, params={"max": 10000, "offset": 0})
-    if not r.ok:
-        return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
-    return r.json()
+    try:
+        path = f"/printproducts/products/{product_uuid}/baseprices"
+        r, dbg = four_over().get(path, params={"max": 10000, "offset": 0})
+        if not r.ok:
+            return {"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg}
+        return r.json()
+    except Exception as e:
+        payload = {"ok": False, "error": str(e)}
+        if DEBUG_ERRORS:
+            payload["trace"] = traceback.format_exc()
+        return JSONResponse(status_code=500, content=payload)
 
 
 @router.post("/reset_tester_tables")
 def reset_tester_tables(db: Session = Depends(get_db)):
-    """
-    Wipes ONLY the tester tables used by this doorhangers pricing tester.
-    """
     db.execute(sql_text("TRUNCATE TABLE product_option_values RESTART IDENTITY CASCADE"))
     db.execute(sql_text("TRUNCATE TABLE product_option_groups RESTART IDENTITY CASCADE"))
     db.execute(sql_text("TRUNCATE TABLE product_baseprices RESTART IDENTITY CASCADE"))
@@ -93,155 +143,148 @@ def reset_tester_tables(db: Session = Depends(get_db)):
 
 
 @router.post("/import/{product_uuid}")
-def import_product_bundle(
-    product_uuid: str,
-    db: Session = Depends(get_db),
-):
+def import_product_bundle(product_uuid: str, db: Session = Depends(get_db)):
     """
     Pulls from 4over LIVE and imports into Postgres:
-      - products row
+      - product row
       - optiongroups + option values
-      - baseprices matrix (runsize/colorspec combos)
-    Safe to re-run because we delete+reinsert per-product.
+      - baseprices matrix
     """
-    # 1) fetch product record (from category list; easiest)
-    cat_path = f"/printproducts/categories/{DOORHANGERS_CATEGORY_UUID}/products"
-    r, _dbg = four_over().get(cat_path, params={"max": 5000, "offset": 0})
-    if not r.ok:
-        raise HTTPException(status_code=r.status_code, detail=_json_or_text(r))
+    try:
+        # get product record from category list
+        cat_path = f"/printproducts/categories/{DOORHANGERS_CATEGORY_UUID}/products"
+        r, dbg = four_over().get(cat_path, params={"max": 5000, "offset": 0})
+        if not r.ok:
+            return JSONResponse(
+                status_code=r.status_code,
+                content={"ok": False, "http_status": r.status_code, "body": _json_or_text(r), "debug": dbg},
+            )
 
-    items = _entities(r.json())
-    p = next((x for x in items if x.get("product_uuid") == product_uuid), None)
-    if not p:
-        raise HTTPException(status_code=404, detail="Product not found in category list")
+        items = _entities(r.json())
+        p = next((x for x in items if x.get("product_uuid") == product_uuid), None)
+        if not p:
+            raise HTTPException(status_code=404, detail="Product not found in category list")
 
-    # 2) fetch optiongroups + baseprices
-    og = optiongroups(product_uuid)
-    bp = baseprices(product_uuid)
+        og = optiongroups(product_uuid)
+        bp = baseprices(product_uuid)
 
-    og_items = _entities(og)
-    bp_items = _entities(bp)
+        og_items = _entities(og)
+        bp_items = _entities(bp)
 
-    # 3) upsert product
-    prod_row = {
-        "product_uuid": product_uuid,
-        "product_code": p.get("product_code"),
-        "product_description": p.get("product_description"),
-        "categories_path": p.get("categories") or p.get("product_categories"),
-        "optiongroups_path": p.get("product_option_groups"),
-        "baseprices_path": p.get("product_base_prices"),
-    }
+        prod_row = {
+            "product_uuid": product_uuid,
+            "product_code": p.get("product_code"),
+            "product_description": p.get("product_description"),
+            "categories_path": p.get("categories") or p.get("product_categories"),
+            "optiongroups_path": p.get("product_option_groups"),
+            "baseprices_path": p.get("product_base_prices"),
+        }
 
-    # 4) delete existing per-product rows (so reimport is clean)
-    db.query(ProductOptionValue).filter(
-        ProductOptionValue.product_option_group_uuid.in_(
-            db.query(ProductOptionGroup.product_option_group_uuid).filter(ProductOptionGroup.product_uuid == product_uuid)
-        )
-    ).delete(synchronize_session=False)
+        # delete existing per-product rows
+        db.query(ProductOptionValue).filter(
+            ProductOptionValue.product_option_group_uuid.in_(
+                db.query(ProductOptionGroup.product_option_group_uuid).filter(ProductOptionGroup.product_uuid == product_uuid)
+            )
+        ).delete(synchronize_session=False)
 
-    db.query(ProductOptionGroup).filter(ProductOptionGroup.product_uuid == product_uuid).delete(synchronize_session=False)
-    db.query(ProductBasePrice).filter(ProductBasePrice.product_uuid == product_uuid).delete(synchronize_session=False)
-    db.query(Product).filter(Product.product_uuid == product_uuid).delete(synchronize_session=False)
-    db.commit()
+        db.query(ProductOptionGroup).filter(ProductOptionGroup.product_uuid == product_uuid).delete(synchronize_session=False)
+        db.query(ProductBasePrice).filter(ProductBasePrice.product_uuid == product_uuid).delete(synchronize_session=False)
+        db.query(Product).filter(Product.product_uuid == product_uuid).delete(synchronize_session=False)
+        db.commit()
 
-    # 5) insert product
-    db.execute(pg_insert(Product.__table__).values([prod_row]).on_conflict_do_nothing(index_elements=["product_uuid"]))
+        db.execute(pg_insert(Product.__table__).values([prod_row]).on_conflict_do_nothing(index_elements=["product_uuid"]))
 
-    # 6) option groups + values
-    pog_rows: List[Dict[str, Any]] = []
-    pov_rows: List[Dict[str, Any]] = []
+        pog_rows: List[Dict[str, Any]] = []
+        pov_rows: List[Dict[str, Any]] = []
 
-    for g in og_items:
-        guid = g.get("product_option_group_uuid") or g.get("option_group_uuid") or g.get("uuid")
-        if not guid:
-            continue
+        for g in og_items:
+            guid = g.get("product_option_group_uuid") or g.get("option_group_uuid") or g.get("uuid")
+            if not guid:
+                continue
 
-        # NOTE: your working response uses: name/minoccurs/maxoccurs and values[]
-        pog_rows.append(
-            {
-                "product_option_group_uuid": str(guid),
-                "product_uuid": product_uuid,
-                "name": g.get("name") or g.get("product_option_group_name"),
-                "minoccurs": str(g.get("minoccurs") or ""),
-                "maxoccurs": str(g.get("maxoccurs") or ""),
-            }
-        )
+            pog_rows.append(
+                {
+                    "product_option_group_uuid": str(guid),
+                    "product_uuid": product_uuid,
+                    "name": g.get("name") or g.get("product_option_group_name"),
+                    "minoccurs": str(g.get("minoccurs") or ""),
+                    "maxoccurs": str(g.get("maxoccurs") or ""),
+                }
+            )
 
-        values = g.get("values") or g.get("options") or []
-        if isinstance(values, list):
-            for v in values:
-                vuid = v.get("product_option_value_uuid") or v.get("option_uuid") or v.get("uuid") or v.get("option_value_uuid")
-                if not vuid:
-                    continue
+            values = g.get("values") or g.get("options") or []
+            if isinstance(values, list):
+                for v in values:
+                    vuid = v.get("product_option_value_uuid") or v.get("option_uuid") or v.get("uuid") or v.get("option_value_uuid")
+                    if not vuid:
+                        continue
+                    pov_rows.append(
+                        {
+                            "product_option_value_uuid": str(vuid),
+                            "product_option_group_uuid": str(guid),
+                            "name": v.get("name") or v.get("option_name"),
+                            "code": v.get("code") or v.get("option_name"),
+                            "sort": v.get("sort") if isinstance(v.get("sort"), int) else None,
+                            "runsize_uuid": v.get("runsize_uuid"),
+                            "runsize": v.get("runsize"),
+                            "colorspec_uuid": v.get("colorspec_uuid"),
+                            "colorspec": v.get("colorspec"),
+                            "turnaround_uuid": v.get("turnaround_uuid"),
+                            "turnaround": v.get("turnaround"),
+                        }
+                    )
 
-                pov_rows.append(
-                    {
-                        "product_option_value_uuid": str(vuid),
-                        "product_option_group_uuid": str(guid),
-                        "name": v.get("name") or v.get("option_name"),
-                        "code": v.get("code") or v.get("option_name"),
-                        "sort": v.get("sort") if isinstance(v.get("sort"), int) else None,
-                        # optional matrix fields if present
-                        "runsize_uuid": v.get("runsize_uuid"),
-                        "runsize": v.get("runsize"),
-                        "colorspec_uuid": v.get("colorspec_uuid"),
-                        "colorspec": v.get("colorspec"),
-                        "turnaround_uuid": v.get("turnaround_uuid"),
-                        "turnaround": v.get("turnaround"),
-                    }
-                )
+        pog_rows = _dedupe_by_key(pog_rows, "product_option_group_uuid")
+        pov_rows = _dedupe_by_key(pov_rows, "product_option_value_uuid")
 
-    pog_rows = _dedupe_by_key(pog_rows, "product_option_group_uuid")
-    pov_rows = _dedupe_by_key(pov_rows, "product_option_value_uuid")
+        if pog_rows:
+            db.execute(pg_insert(ProductOptionGroup.__table__).values(pog_rows))
+        if pov_rows:
+            db.execute(pg_insert(ProductOptionValue.__table__).values(pov_rows))
 
-    if pog_rows:
-        db.execute(pg_insert(ProductOptionGroup.__table__).values(pog_rows))
+        pbp_rows: List[Dict[str, Any]] = []
+        for x in bp_items:
+            buid = x.get("base_price_uuid") or x.get("product_baseprice_uuid") or x.get("uuid")
+            if not buid:
+                continue
+            pbp_rows.append(
+                {
+                    "base_price_uuid": str(buid),
+                    "product_uuid": product_uuid,
+                    "product_baseprice": x.get("product_baseprice") or x.get("price"),
+                    "runsize_uuid": x.get("runsize_uuid"),
+                    "runsize": x.get("runsize"),
+                    "colorspec_uuid": x.get("colorspec_uuid"),
+                    "colorspec": x.get("colorspec"),
+                    "turnaround_uuid": x.get("turnaround_uuid"),
+                    "turnaround": x.get("turnaround"),
+                    "can_group_ship": bool(x.get("can_group_ship", False)) if x.get("can_group_ship") is not None else None,
+                }
+            )
 
-    if pov_rows:
-        db.execute(pg_insert(ProductOptionValue.__table__).values(pov_rows))
+        pbp_rows = _dedupe_by_key(pbp_rows, "base_price_uuid")
+        if pbp_rows:
+            db.execute(pg_insert(ProductBasePrice.__table__).values(pbp_rows))
 
-    # 7) base prices matrix
-    pbp_rows: List[Dict[str, Any]] = []
-    for x in bp_items:
-        buid = x.get("base_price_uuid") or x.get("product_baseprice_uuid") or x.get("uuid")
-        if not buid:
-            continue
-        pbp_rows.append(
-            {
-                "base_price_uuid": str(buid),
-                "product_uuid": product_uuid,
-                "product_baseprice": x.get("product_baseprice") or x.get("price"),
-                "runsize_uuid": x.get("runsize_uuid"),
-                "runsize": x.get("runsize"),
-                "colorspec_uuid": x.get("colorspec_uuid"),
-                "colorspec": x.get("colorspec"),
-                "turnaround_uuid": x.get("turnaround_uuid"),
-                "turnaround": x.get("turnaround"),
-                "can_group_ship": bool(x.get("can_group_ship", False)) if x.get("can_group_ship") is not None else None,
-            }
-        )
+        db.commit()
 
-    pbp_rows = _dedupe_by_key(pbp_rows, "base_price_uuid")
+        return {
+            "ok": True,
+            "product_uuid": product_uuid,
+            "option_groups": len(pog_rows),
+            "option_values": len(pov_rows),
+            "base_prices": len(pbp_rows),
+        }
 
-    if pbp_rows:
-        db.execute(pg_insert(ProductBasePrice.__table__).values(pbp_rows))
-
-    db.commit()
-
-    return {
-        "ok": True,
-        "product_uuid": product_uuid,
-        "option_groups": len(pog_rows),
-        "option_values": len(pov_rows),
-        "base_prices": len(pbp_rows),
-    }
+    except Exception as e:
+        payload = {"ok": False, "error": str(e)}
+        if DEBUG_ERRORS:
+            payload["trace"] = traceback.format_exc()
+        return JSONResponse(status_code=500, content=payload)
 
 
 @router.get("/matrix_keys")
 def matrix_keys(product_uuid: str, db: Session = Depends(get_db)):
-    """
-    Returns unique runsize/colorspec UUIDs seen in base price matrix for a product.
-    """
     rows = db.query(ProductBasePrice).filter(ProductBasePrice.product_uuid == product_uuid).all()
 
     run_map = {}

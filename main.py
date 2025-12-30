@@ -1,7 +1,10 @@
-from fastapi import FastAPI, HTTPException, Query, Depends
+```python
+from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.responses import JSONResponse
 from typing import Any, Dict, List, Optional
 import re
+import os
+import traceback
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sql_text
@@ -20,6 +23,23 @@ BUILD = "BASELINE_WHOAMI_WORKING_2025-12-30_FIX_DUPES"
 DOORHANGERS_CATEGORY_UUID = "5cacc269-e6a8-472d-91d6-792c4584cae8"
 
 app = FastAPI(title=APP_NAME)
+
+# ---------------------------
+# Global error handler (so 500s show real reason)
+# Set Railway var: DEBUG_ERRORS=1 to include stack trace
+# ---------------------------
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") == "1"
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    payload = {"ok": False, "error": str(exc)}
+    if DEBUG_ERRORS:
+        payload["trace"] = traceback.format_exc()[:4000]
+        payload["path"] = str(request.url)
+        payload["method"] = request.method
+    return JSONResponse(status_code=500, content=payload)
+
 
 # create tables if missing
 Base.metadata.create_all(bind=engine)
@@ -424,3 +444,4 @@ def doorhangers_help():
         "doorhangers_category_uuid": DOORHANGERS_CATEGORY_UUID,
         "note": "Run sync_25 first, then tester_list to pick a product_uuid.",
     }
+```

@@ -1,4 +1,3 @@
-```python
 from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.responses import JSONResponse
 from typing import Any, Dict, List, Optional
@@ -444,4 +443,3 @@ def doorhangers_help():
         "doorhangers_category_uuid": DOORHANGERS_CATEGORY_UUID,
         "note": "Run sync_25 first, then tester_list to pick a product_uuid.",
     }
-```

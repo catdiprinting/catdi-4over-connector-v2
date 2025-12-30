@@ -38,8 +38,26 @@ def _json_or_text(resp):
 
 @app.on_event("startup")
 def startup():
-    # Create tables if they don't exist (simple, no Alembic yet)
+    # Create tables if missing
     SqlBase.metadata.create_all(bind=engine)
+
+    # Patch existing tables (Railway Postgres) when columns are missing
+    try:
+        with engine.connect() as conn:
+            # products table schema patches (safe / idempotent)
+            conn.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS full_product_path TEXT"))
+            conn.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS categories_path TEXT"))
+            conn.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS optiongroups_path TEXT"))
+            conn.execute(text("ALTER TABLE products ADD COLUMN IF NOT EXISTS baseprices_path TEXT"))
+
+            # in case older DB had product_description but different type, ignore (we won't alter types here)
+
+            conn.commit()
+    except Exception:
+        # If this fails, it's usually because the table doesn't exist yet (first boot),
+        # or permissions; create_all above should handle first boot.
+        pass
+
 
 
 @app.get("/")

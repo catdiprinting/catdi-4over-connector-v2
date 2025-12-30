@@ -3,6 +3,10 @@ from db import engine, Base
 
 from pricing_tester import router as pricing_router
 
+from pricing_tester import router as pricing_router
+app.include_router(pricing_router)
+
+
 app = FastAPI(title="catdi-4over-connector")
 
 # Create pricing tables

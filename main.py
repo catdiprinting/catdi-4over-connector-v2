@@ -1,75 +1,62 @@
 # main.py
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import traceback
+from sqlalchemy import text
 
-from db import engine, Base, db_ping
+from db import engine, Base
+import db as db_module
 
-APP_NAME = "catdi-4over-connector"
-PHASE = "SAFE_BOOT"
-BUILD = "SAFE_BOOT_2025-12-30_FIX_MODELS_AND_DB_PING"
+app = FastAPI(title="catdi-4over-connector", version="SAFE_AND_STABLE")
 
-app = FastAPI(title=APP_NAME)
-
-# Always create tables that exist in metadata
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception:
-    # don't crash boot on table create
-    pass
+# Create tables (safe to call on boot)
+Base.metadata.create_all(bind=engine)
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": APP_NAME, "phase": PHASE, "build": BUILD}
+    return {"ok": True, "service": "catdi-4over-connector"}
 
 
 @app.get("/db/ping")
-def db_ping_route():
-    db_ping()
+def db_ping():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
     return {"ok": True}
 
 
 @app.get("/diag")
 def diag():
-    report = {
-        "service": APP_NAME,
-        "phase": PHASE,
-        "build": BUILD,
-        "imports": {},
-        "notes": [],
-    }
+    """
+    SAFE_BOOT import diagnostics so app doesn't hard-crash if a module breaks.
+    """
+    results = {"service": "catdi-4over-connector", "phase": "SAFE_BOOT", "build": "SAFE_BOOT", "imports": {}, "notes": []}
 
-    # db.py always
+    def _try(name, fn):
+        try:
+            fn()
+            results["imports"][name] = {"ok": True, "error": ""}
+        except Exception as e:
+            results["imports"][name] = {"ok": False, "error": str(e)}
+            results["notes"].append(f"{name} import failed - routes depending on it will be disabled")
+
+    _try("db.py", lambda: __import__("db"))
+    _try("models.py", lambda: __import__("models"))
+    _try("fourover_client.py", lambda: __import__("fourover_client"))
+
+    # Try include router(s)
     try:
-        import db as _db  # noqa
-        report["imports"]["db.py"] = {"ok": True, "error": ""}
+        from doorhangers import router as doorhangers_router
+        app.include_router(doorhangers_router)
+        results["imports"]["doorhangers.py (router include)"] = {"ok": True, "error": ""}
     except Exception as e:
-        report["imports"]["db.py"] = {"ok": False, "error": str(e)}
+        results["imports"]["doorhangers.py (router include)"] = {"ok": False, "error": str(e)}
+        results["notes"].append("doorhangers router failed to include - check error in /diag")
 
-    # models.py
-    try:
-        from models import Product, ProductOptionGroup, ProductOptionValue, ProductBasePrice  # noqa
-        report["imports"]["models.py"] = {"ok": True, "error": ""}
-    except Exception as e:
-        report["imports"]["models.py"] = {"ok": False, "error": str(e)}
-        report["notes"].append("models import failed - routes depending on models will be disabled")
-
-    # doorhangers router
-    try:
-        from doorhangers import router as doorhangers_router  # noqa
-        report["imports"]["doorhangers.py (router include)"] = {"ok": True, "error": ""}
-    except Exception as e:
-        report["imports"]["doorhangers.py (router include)"] = {"ok": False, "error": str(e)}
-        report["notes"].append("doorhangers router failed to include - check error in /diag")
-
-    return report
+    return results
 
 
-# Try to include the router on boot (but do NOT crash if it fails)
+# Include routers normally (non-diag path). If they fail, /diag still works.
 try:
     from doorhangers import router as doorhangers_router
     app.include_router(doorhangers_router)
 except Exception:
-    # keep app alive with SAFE_BOOT endpoints
     pass

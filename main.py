@@ -13,6 +13,8 @@ from sqlalchemy import inspect
 from fourover_client import FourOverClient
 from db import engine, Base, get_db, db_ping
 from models import Product, ProductOptionGroup, ProductOptionValue, ProductBasePrice
+from pricing_tester import router as pricing_router
+
 
 APP_NAME = "catdi-4over-connector"
 PHASE = "DOORHANGERS_PHASE1"
@@ -21,6 +23,7 @@ BUILD = "BASELINE_WHOAMI_WORKING_2025-12-30_SCHEMA_GUARD_V2_KEYMAPS"
 DOORHANGERS_CATEGORY_UUID = "5cacc269-e6a8-472d-91d6-792c4584cae8"
 
 app = FastAPI(title=APP_NAME)
+app.include_router(pricing_router)
 
 _client: Optional[FourOverClient] = None
 

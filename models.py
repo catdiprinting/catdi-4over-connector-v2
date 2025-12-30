@@ -1,4 +1,4 @@
-# app/models.py
+# models.py
 from sqlalchemy import (
     Column, String, Integer, Numeric, Boolean, ForeignKey,
     UniqueConstraint, Index, Text

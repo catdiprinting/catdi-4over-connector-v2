@@ -1,46 +1,51 @@
+# fourover_client.py
 import os
-import time
-import hmac
 import hashlib
+import hmac
 import requests
 from urllib.parse import urlencode
 
 
 class FourOverClient:
+    """
+    Docs-based auth (reverted to API docs):
+      signature = HMAC_SHA256(key=SHA256(private_key), msg=HTTP_METHOD)
+    For GET/DELETE: pass apikey + signature in querystring. :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
+    """
+
     def __init__(self):
         self.base_url = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
-        self.apikey = os.getenv("FOUR_OVER_APIKEY", "")
-        self.private_key = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
+        self.public_key = os.getenv("FOUR_OVER_APIKEY", "").strip()
+        self.private_key = os.getenv("FOUR_OVER_PRIVATE_KEY", "").strip()
 
-        if not self.apikey or not self.private_key:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
+        if not self.public_key or not self.private_key:
+            raise RuntimeError("Missing FOUR_OVER_APIKEY and/or FOUR_OVER_PRIVATE_KEY env vars")
 
-    def _sign(self, canonical: str) -> str:
-        return hmac.new(self.private_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        self._hashed_private = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
 
-    def _build_url(self, path: str, params: dict | None = None) -> str:
-        path = "/" + path.lstrip("/")
-        params = params or {}
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json"})
 
-        # 4over signature pattern: signature over "path?sorted_query_without_signature"
-        # Always include apikey in query
-        params["apikey"] = self.apikey
+    def _signature_for_method(self, method: str) -> str:
+        msg = method.upper().encode("utf-8")
+        key = self._hashed_private.encode("utf-8")
+        return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
-        # Build canonical query string (sorted)
-        sorted_items = sorted(params.items(), key=lambda kv: kv[0])
-        query = urlencode(sorted_items)
+    def get(self, path: str, params: dict | None = None, timeout: int = 30) -> requests.Response:
+        params = dict(params or {})
+        params["apikey"] = self.public_key
+        params["signature"] = self._signature_for_method("GET")
 
-        canonical = f"{path}?{query}"
-        signature = self._sign(canonical)
+        url = f"{self.base_url}{path}"
+        return self.session.get(url, params=params, timeout=timeout)
 
-        # Add signature and timestamp
-        # (Some 4over setups accept timestamp; you already have whoami working, keep consistent)
-        ts = str(int(time.time()))
-        full_query = f"{query}&signature={signature}&timestamp={ts}"
-        return f"{self.base_url}{path}?{full_query}"
-
-    def get(self, path: str, params: dict | None = None, timeout: int = 30):
-        url = self._build_url(path, params=params)
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
+    def debug_get_url(self, path: str, params: dict | None = None) -> dict:
+        params = dict(params or {})
+        params["apikey"] = self.public_key
+        params["signature"] = self._signature_for_method("GET")
+        return {
+            "base_url": self.base_url,
+            "path": path,
+            "query": params,
+            "full_url": f"{self.base_url}{path}?{urlencode(params)}",
+        }

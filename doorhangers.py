@@ -1,52 +1,32 @@
 # doorhangers.py
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from db import get_db
-from models import (
-    Product,
-    ProductOptionGroup,
-    ProductOptionValue,
-    ProductBasePrice,
-)
+from models import Product, ProductBasePrice
 
 router = APIRouter(prefix="/doorhangers", tags=["doorhangers"])
 
 
 @router.get("/products")
-def list_products(max: int = 25, offset: int = 0, db: Session = Depends(get_db)):
-    rows = db.execute(
-        select(Product).offset(offset).limit(max)
-    ).scalars().all()
-
+def products(max: int = Query(5, ge=1, le=5000), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
+    rows = db.execute(select(Product).offset(offset).limit(max)).scalars().all()
     return {
         "count": len(rows),
         "products": [
             {
-                "product_uuid": r.product_uuid,
-                "product_code": r.product_code,
-                "product_description": r.product_description,
+                "product_uuid": p.product_uuid,
+                "product_code": p.product_code,
+                "product_description": p.product_description,
             }
-            for r in rows
+            for p in rows
         ],
     }
 
 
-@router.post("/import/{product_uuid}")
-def import_product(product_uuid: str, db: Session = Depends(get_db)):
-    """
-    SAFETY PLACEHOLDER
-    Import already tested elsewhere — this endpoint should NEVER 500.
-    """
-    return {"ok": True, "product_uuid": product_uuid}
-
-
 @router.get("/matrix_keys")
 def matrix_keys(product_uuid: str, db: Session = Depends(get_db)):
-    """
-    Pull valid runsize + colorspec combos FROM BASE PRICES (correct per 4over docs)
-    """
     rows = db.execute(
         select(
             ProductBasePrice.runsize_uuid,
@@ -56,31 +36,26 @@ def matrix_keys(product_uuid: str, db: Session = Depends(get_db)):
         ).where(ProductBasePrice.product_uuid == product_uuid)
     ).all()
 
-    if not rows:
-        return {"ok": True, "product_uuid": product_uuid, "runsizes": [], "colorspecs": []}
-
     runsizes = {}
     colorspecs = {}
 
     for r in rows:
-        runsizes[r.runsize_uuid] = r.runsize
-        colorspecs[r.colorspec_uuid] = r.colorspec
+        if r.runsize_uuid:
+            runsizes[str(r.runsize_uuid)] = r.runsize
+        if r.colorspec_uuid:
+            colorspecs[str(r.colorspec_uuid)] = r.colorspec
 
     return {
         "ok": True,
         "product_uuid": product_uuid,
         "runsizes": [{"uuid": k, "label": v} for k, v in runsizes.items()],
         "colorspecs": [{"uuid": k, "label": v} for k, v in colorspecs.items()],
+        "rows": len(rows),
     }
 
 
 @router.get("/price")
-def get_price(
-    product_uuid: str,
-    runsize_uuid: str,
-    colorspec_uuid: str,
-    db: Session = Depends(get_db),
-):
+def price(product_uuid: str, runsize_uuid: str, colorspec_uuid: str, db: Session = Depends(get_db)):
     row = db.execute(
         select(ProductBasePrice).where(
             ProductBasePrice.product_uuid == product_uuid,
@@ -90,11 +65,14 @@ def get_price(
     ).scalars().first()
 
     if not row:
-        raise HTTPException(status_code=404, detail="No price found")
+        raise HTTPException(status_code=404, detail="No base price found for that combo")
 
     return {
+        "ok": True,
         "product_uuid": product_uuid,
+        "runsize_uuid": runsize_uuid,
+        "colorspec_uuid": colorspec_uuid,
         "runsize": row.runsize,
         "colorspec": row.colorspec,
-        "base_price": float(row.product_baseprice),
+        "base_price": float(row.product_baseprice) if row.product_baseprice is not None else None,
     }

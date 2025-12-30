@@ -4,6 +4,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
+# Railway Postgres URLs sometimes start with postgres://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -20,11 +21,9 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-
 def db_ping() -> None:
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
-
 
 def get_db():
     db = SessionLocal()

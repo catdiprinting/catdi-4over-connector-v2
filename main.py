@@ -1,128 +1,240 @@
-# main.py
-import time
-import hashlib
-import requests
-
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy import select, desc
+from sqlalchemy.exc import SQLAlchemyError
+import traceback
 
-from config import FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY, FOUR_OVER_BASE_URL, DEBUG
-from db import engine, SessionLocal
-from models import Base
+import fourover_client as fourover
+from fourover_client import FourOverError
 
-APP_INFO = {
-    "service": "catdi-4over-connector",
-    "phase": "0.9",
-    "build": "ROOT_MAIN_PY_V4_SAFE_ERRORS",
-}
+from db import SessionLocal, engine
+from models import Base, BasePriceCache
 
-app = FastAPI(title="Catdi 4over Connector")
 
-# ---------- DB dependency ----------
-def get_db():
+SERVICE_NAME = "catdi-4over-connector"
+PHASE = "0.9"
+BUILD = "ROOT_MAIN_PY_V5_SINGLE_AUTH"
+
+
+app = FastAPI(title=SERVICE_NAME, version=PHASE)
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def safe_error(detail: dict, status_code: int = 500):
+    """Return consistent error payloads (prevents Railway 502 crash loops)."""
+    return JSONResponse(status_code=status_code, content={"detail": detail})
+
+
+def db_session():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-# ---------- global error handler (prevents silent 500s) ----------
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    # If DEBUG=1, show a bit more info; otherwise keep it simple.
-    detail = {"error": "Unhandled server error", "path": str(request.url.path)}
-    if DEBUG:
-        detail["exception"] = repr(exc)
-    return JSONResponse(status_code=500, content={"detail": detail})
 
-# ---------- health endpoints ----------
+# -----------------------------
+# Core health/version endpoints
+# -----------------------------
 @app.get("/version")
 def version():
-    return APP_INFO
+    return {"service": SERVICE_NAME, "phase": PHASE, "build": BUILD}
+
 
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
+
+# -----------------------------
+# DB endpoints
+# -----------------------------
 @app.get("/db/ping")
 def db_ping():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return {"ok": True}
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("SELECT 1")
+        return {"ok": True}
+    except Exception as e:
+        return safe_error(
+            {"error": "db ping failed", "message": str(e)},
+            status_code=500,
+        )
+
 
 @app.post("/db/init")
 def db_init():
     """
-    Creates tables + index safely.
-    Uses SQLAlchemy for tables, and CREATE INDEX IF NOT EXISTS to avoid duplicates.
+    Creates tables safely.
+    If they already exist, don't crash.
     """
     try:
         Base.metadata.create_all(bind=engine)
-
-        with engine.begin() as conn:
-            # Works on Postgres + SQLite
-            conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_baseprice_cache_product_uuid "
-                "ON baseprice_cache (product_uuid)"
-            ))
-
         return {"ok": True}
     except Exception as e:
-        # Return useful info instead of crashing
-        raise HTTPException(status_code=500, detail=f"DB init failed: {repr(e)}")
-
-# ---------- 4over signing ----------
-def sign_4over(canonical: str) -> str:
-    """
-    4over signature = SHA1(canonical + private_key) in hex.
-    canonical example: "/whoami?apikey=catdi&timestamp=123"
-    """
-    if not FOUR_OVER_PRIVATE_KEY:
-        raise HTTPException(status_code=500, detail="Missing env var: FOUR_OVER_PRIVATE_KEY")
-    raw = (canonical + FOUR_OVER_PRIVATE_KEY).encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()
-
-def four_over_get(path: str, extra_params: dict | None = None) -> dict:
-    if not FOUR_OVER_APIKEY:
-        raise HTTPException(status_code=500, detail="Missing env var: FOUR_OVER_APIKEY")
-    base = (FOUR_OVER_BASE_URL or "https://api.4over.com").rstrip("/")
-
-    params = {"apikey": FOUR_OVER_APIKEY, "timestamp": str(int(time.time()))}
-    if extra_params:
-        params.update(extra_params)
-
-    # Build canonical (must match query order we send)
-    # We'll build query string ourselves to keep it deterministic.
-    query = "&".join([f"{k}={params[k]}" for k in params.keys()])
-    canonical = f"{path}?{query}"
-    signature = sign_4over(canonical)
-    params["signature"] = signature
-
-    url = f"{base}{path}"
-
-    try:
-        r = requests.get(url, params=params, timeout=30)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail={"error": "Request failed", "exception": repr(e), "url": url})
-
-    # IMPORTANT: don't crash with raise_for_status(); return structured error
-    if r.status_code >= 400:
-        raise HTTPException(
-            status_code=r.status_code,
-            detail={
-                "error": "4over request failed",
-                "status": r.status_code,
-                "url": r.url,
-                "body": r.text[:1200],
-                "canonical": canonical,
-            },
+        # Avoid crashing the app into 502
+        return safe_error(
+            {"error": "db init failed", "message": str(e)},
+            status_code=500,
         )
 
-    return r.json()
 
-# ---------- 4over endpoints ----------
+# -----------------------------
+# 4over endpoints
+# -----------------------------
 @app.get("/4over/whoami")
 def whoami():
-    return four_over_get("/whoami")
+    try:
+        data = fourover.whoami()
+        return data
+    except FourOverError as e:
+        return safe_error(
+            {
+                "error": "4over request failed",
+                "status": e.status,
+                "url": e.url,
+                "body": e.body,
+                "canonical": e.canonical,
+            },
+            status_code=e.status,
+        )
+    except Exception as e:
+        return safe_error(
+            {"error": "unexpected error", "message": str(e), "trace": traceback.format_exc()},
+            status_code=500,
+        )
+
+
+# -----------------------------
+# Doorhangers endpoints (baseprices + import)
+# -----------------------------
+@app.get("/doorhangers/product/{product_uuid}/baseprices")
+def doorhanger_baseprices(product_uuid: str):
+    try:
+        return fourover.product_baseprices(product_uuid)
+    except FourOverError as e:
+        return safe_error(
+            {
+                "error": "4over request failed",
+                "status": e.status,
+                "url": e.url,
+                "body": e.body,
+                "canonical": e.canonical,
+            },
+            status_code=e.status,
+        )
+    except Exception as e:
+        return safe_error(
+            {"error": "unexpected error", "message": str(e), "trace": traceback.format_exc()},
+            status_code=500,
+        )
+
+
+@app.post("/doorhangers/import/{product_uuid}")
+def doorhanger_import(product_uuid: str):
+    """
+    Fetch baseprices from 4over and store in DB cache.
+    """
+    try:
+        data = fourover.product_baseprices(product_uuid)
+        entities = data.get("entities", [])
+
+        if not isinstance(entities, list) or len(entities) == 0:
+            return safe_error(
+                {"error": "no baseprices returned", "product_uuid": product_uuid, "raw": data},
+                status_code=400,
+            )
+
+        with SessionLocal() as db:
+            # Create a cache row
+            row = BasePriceCache(product_uuid=product_uuid, payload=data)
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+
+            return {"ok": True, "product_uuid": product_uuid, "cache_id": row.id}
+
+    except FourOverError as e:
+        return safe_error(
+            {
+                "error": "4over request failed",
+                "status": e.status,
+                "url": e.url,
+                "body": e.body,
+                "canonical": e.canonical,
+            },
+            status_code=e.status,
+        )
+    except SQLAlchemyError as e:
+        return safe_error(
+            {"error": "db error", "message": str(e)},
+            status_code=500,
+        )
+    except Exception as e:
+        return safe_error(
+            {"error": "unexpected error", "message": str(e), "trace": traceback.format_exc()},
+            status_code=500,
+        )
+
+
+# -----------------------------
+# Cache endpoints
+# -----------------------------
+@app.get("/cache/baseprices")
+def cache_baseprices(limit: int = Query(25, ge=1, le=200)):
+    """
+    Returns the most recent cache rows.
+    """
+    try:
+        with SessionLocal() as db:
+            stmt = select(BasePriceCache).order_by(desc(BasePriceCache.id)).limit(limit)
+            rows = db.execute(stmt).scalars().all()
+
+            return {
+                "ok": True,
+                "count": len(rows),
+                "items": [
+                    {
+                        "id": r.id,
+                        "product_uuid": r.product_uuid,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                    }
+                    for r in rows
+                ],
+            }
+    except Exception as e:
+        return safe_error(
+            {"error": "cache list failed", "message": str(e), "trace": traceback.format_exc()},
+            status_code=500,
+        )
+
+
+@app.get("/cache/baseprices/{product_uuid}")
+def cache_baseprices_by_product(product_uuid: str):
+    """
+    Returns the most recent cached payload for a product_uuid.
+    """
+    try:
+        with SessionLocal() as db:
+            stmt = (
+                select(BasePriceCache)
+                .where(BasePriceCache.product_uuid == product_uuid)
+                .order_by(desc(BasePriceCache.id))
+                .limit(1)
+            )
+            row = db.execute(stmt).scalars().first()
+
+            if not row:
+                raise HTTPException(status_code=404, detail={"error": "not found", "product_uuid": product_uuid})
+
+            return {"ok": True, "id": row.id, "product_uuid": row.product_uuid, "payload": row.payload}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        return safe_error(
+            {"error": "cache fetch failed", "message": str(e), "trace": traceback.format_exc()},
+            status_code=500,
+        )

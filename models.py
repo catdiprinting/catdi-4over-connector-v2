@@ -1,15 +1,14 @@
 # models.py
-from sqlalchemy import Column, Integer, String, Text
-from db import Base
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import Text, BigInteger
+
+class Base(DeclarativeBase):
+    pass
 
 class BasePriceCache(Base):
     __tablename__ = "baseprice_cache"
 
-    id = Column(Integer, primary_key=True, index=True)
-
-    # IMPORTANT:
-    # index=True creates ix_baseprice_cache_product_uuid automatically.
-    # Do NOT also define Index(...) elsewhere for product_uuid.
-    product_uuid = Column(String(64), unique=True, nullable=False, index=True)
-
-    payload_json = Column(Text, nullable=False)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_uuid: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)

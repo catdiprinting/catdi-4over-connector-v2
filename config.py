@@ -1,11 +1,16 @@
+# config.py
 import os
 
-FOUR_OVER_BASE_URL = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
-FOUR_OVER_APIKEY = os.getenv("FOUR_OVER_APIKEY", "")
-FOUR_OVER_PRIVATE_KEY = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
+def env(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name, default)
+    if v is not None:
+        v = v.strip()
+    return v
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
+FOUR_OVER_APIKEY = env("FOUR_OVER_APIKEY")         # e.g. "catdi"
+FOUR_OVER_PRIVATE_KEY = env("FOUR_OVER_PRIVATE_KEY")
+FOUR_OVER_BASE_URL = env("FOUR_OVER_BASE_URL", "https://api.4over.com")
 
-SERVICE_NAME = os.getenv("SERVICE_NAME", "catdi-4over-connector")
-PHASE = os.getenv("PHASE", "0.9")
-BUILD = os.getenv("BUILD", "ROOT_MAIN_PY_V3_NO_MODELS")
+DATABASE_URL = env("DATABASE_URL", "sqlite:///./local.db")
+
+DEBUG = (env("DEBUG", "0") == "1")

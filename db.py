@@ -10,8 +10,14 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 connect_args = {}
+
+# SQLite only
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
+
+# Postgres (psycopg) connect timeout so the app doesn't hang on boot
+if DATABASE_URL.startswith("postgresql://"):
+    connect_args = {"connect_timeout": 5}
 
 engine = create_engine(
     DATABASE_URL,

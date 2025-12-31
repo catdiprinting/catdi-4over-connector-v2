@@ -1,10 +1,11 @@
-from sqlalchemy import Column, Integer, String, Text
+from sqlalchemy import Column, String, Numeric
 from db import Base
 
-class RawPayload(Base):
-    __tablename__ = "raw_payloads"
+class ProductBasePrice(Base):
+    __tablename__ = "product_base_prices"
 
-    id = Column(Integer, primary_key=True, index=True)
-    kind = Column(String(50), index=True)          # e.g. "whoami", "categories", "product"
-    ref_id = Column(String(100), index=True)       # e.g. product_uuid / category_uuid
-    payload_json = Column(Text)                    # raw JSON string
+    base_price_uuid = Column(String, primary_key=True)
+    product_uuid = Column(String, index=True)
+    runsize = Column(String)
+    colorspec = Column(String)
+    product_baseprice = Column(Numeric)

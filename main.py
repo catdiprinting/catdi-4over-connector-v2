@@ -1,20 +1,26 @@
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import text
+# main.py
 import time
-import hmac
 import hashlib
 import requests
-import json
 
-from db import SessionLocal
-import config
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-app = FastAPI()
+from config import FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY, FOUR_OVER_BASE_URL, DEBUG
+from db import engine, SessionLocal
+from models import Base
 
-# -----------------------
-# DB Dependency
-# -----------------------
+APP_INFO = {
+    "service": "catdi-4over-connector",
+    "phase": "0.9",
+    "build": "ROOT_MAIN_PY_V4_SAFE_ERRORS",
+}
+
+app = FastAPI(title="Catdi 4over Connector")
+
+# ---------- DB dependency ----------
 def get_db():
     db = SessionLocal()
     try:
@@ -22,173 +28,101 @@ def get_db():
     finally:
         db.close()
 
-# -----------------------
-# Health / Version
-# -----------------------
+# ---------- global error handler (prevents silent 500s) ----------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # If DEBUG=1, show a bit more info; otherwise keep it simple.
+    detail = {"error": "Unhandled server error", "path": str(request.url.path)}
+    if DEBUG:
+        detail["exception"] = repr(exc)
+    return JSONResponse(status_code=500, content={"detail": detail})
+
+# ---------- health endpoints ----------
 @app.get("/version")
 def version():
-    return {
-        "service": config.SERVICE_NAME,
-        "phase": config.PHASE,
-        "build": config.BUILD,
-    }
+    return APP_INFO
 
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
 @app.get("/db/ping")
-def db_ping(db: Session = Depends(get_db)):
-    db.execute(text("SELECT 1"))
+def db_ping():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
     return {"ok": True}
 
-# -----------------------
-# DB Init (RAW SQL)
-# -----------------------
 @app.post("/db/init")
-def db_init(db: Session = Depends(get_db)):
-    # Create table if missing (Postgres + SQLite compatible)
-    db.execute(text("""
-        CREATE TABLE IF NOT EXISTS baseprice_cache (
-            id SERIAL PRIMARY KEY,
-            product_uuid TEXT NOT NULL,
-            created_at BIGINT NOT NULL,
-            payload TEXT NOT NULL
-        )
-    """))
-
-    # Create index if missing (Postgres)
+def db_init():
+    """
+    Creates tables + index safely.
+    Uses SQLAlchemy for tables, and CREATE INDEX IF NOT EXISTS to avoid duplicates.
+    """
     try:
-        db.execute(text("CREATE INDEX IF NOT EXISTS ix_baseprice_cache_product_uuid ON baseprice_cache (product_uuid)"))
-    except Exception:
-        # SQLite older versions or weird adapters might not support IF NOT EXISTS for index
-        pass
+        Base.metadata.create_all(bind=engine)
 
-    db.commit()
-    return {"ok": True}
+        with engine.begin() as conn:
+            # Works on Postgres + SQLite
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_baseprice_cache_product_uuid "
+                "ON baseprice_cache (product_uuid)"
+            ))
 
-# -----------------------
-# 4over Signing
-# -----------------------
+        return {"ok": True}
+    except Exception as e:
+        # Return useful info instead of crashing
+        raise HTTPException(status_code=500, detail=f"DB init failed: {repr(e)}")
+
+# ---------- 4over signing ----------
 def sign_4over(canonical: str) -> str:
-    # canonical MUST start with / and include query string without signature
-    if not canonical.startswith("/"):
-        canonical = "/" + canonical
+    """
+    4over signature = SHA1(canonical + private_key) in hex.
+    canonical example: "/whoami?apikey=catdi&timestamp=123"
+    """
+    if not FOUR_OVER_PRIVATE_KEY:
+        raise HTTPException(status_code=500, detail="Missing env var: FOUR_OVER_PRIVATE_KEY")
+    raw = (canonical + FOUR_OVER_PRIVATE_KEY).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
 
-    if not config.FOUR_OVER_PRIVATE_KEY:
-        raise RuntimeError("FOUR_OVER_PRIVATE_KEY is missing")
+def four_over_get(path: str, extra_params: dict | None = None) -> dict:
+    if not FOUR_OVER_APIKEY:
+        raise HTTPException(status_code=500, detail="Missing env var: FOUR_OVER_APIKEY")
+    base = (FOUR_OVER_BASE_URL or "https://api.4over.com").rstrip("/")
 
-    digest = hmac.new(
-        config.FOUR_OVER_PRIVATE_KEY.encode("utf-8"),
-        canonical.encode("utf-8"),
-        hashlib.sha1
-    ).hexdigest()
-    return digest
+    params = {"apikey": FOUR_OVER_APIKEY, "timestamp": str(int(time.time()))}
+    if extra_params:
+        params.update(extra_params)
 
-def four_over_get(path: str, params: dict):
-    base = config.FOUR_OVER_BASE_URL
-    url = f"{base}{path}"
-
-    # required params
-    params = dict(params or {})
-    params["apikey"] = config.FOUR_OVER_APIKEY
-    params["timestamp"] = str(int(time.time()))
-
-    # canonical string per 4over style: "/path?apikey=...&timestamp=..."
-    # IMPORTANT: sort params, exclude signature
-    qp = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
-    canonical = f"{path}?{qp}"
+    # Build canonical (must match query order we send)
+    # We'll build query string ourselves to keep it deterministic.
+    query = "&".join([f"{k}={params[k]}" for k in params.keys()])
+    canonical = f"{path}?{query}"
     signature = sign_4over(canonical)
-
     params["signature"] = signature
 
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
+    url = f"{base}{path}"
+
+    try:
+        r = requests.get(url, params=params, timeout=30)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "Request failed", "exception": repr(e), "url": url})
+
+    # IMPORTANT: don't crash with raise_for_status(); return structured error
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail={
+                "error": "4over request failed",
+                "status": r.status_code,
+                "url": r.url,
+                "body": r.text[:1200],
+                "canonical": canonical,
+            },
+        )
+
     return r.json()
 
-# -----------------------
-# 4over WhoAmI
-# -----------------------
+# ---------- 4over endpoints ----------
 @app.get("/4over/whoami")
 def whoami():
-    data = four_over_get("/whoami", {})
-    return data
-
-# -----------------------
-# Doorhangers - Baseprices passthru
-# -----------------------
-@app.get("/doorhangers/product/{product_uuid}/baseprices")
-def doorhanger_baseprices(product_uuid: str):
-    return four_over_get(f"/printproducts/products/{product_uuid}/baseprices", {})
-
-# -----------------------
-# Import to Cache
-# -----------------------
-@app.post("/doorhangers/import/{product_uuid}")
-def import_baseprices(product_uuid: str, db: Session = Depends(get_db)):
-    data = four_over_get(f"/printproducts/products/{product_uuid}/baseprices", {})
-
-    payload_str = json.dumps(data)
-
-    db.execute(
-        text("""
-            INSERT INTO baseprice_cache (product_uuid, created_at, payload)
-            VALUES (:product_uuid, :created_at, :payload)
-        """),
-        {"product_uuid": product_uuid, "created_at": int(time.time()), "payload": payload_str}
-    )
-    db.commit()
-
-    # return latest row id
-    row = db.execute(
-        text("""
-            SELECT id FROM baseprice_cache
-            WHERE product_uuid = :product_uuid
-            ORDER BY id DESC
-            LIMIT 1
-        """),
-        {"product_uuid": product_uuid}
-    ).first()
-
-    return {"ok": True, "product_uuid": product_uuid, "cache_id": row[0] if row else None}
-
-# -----------------------
-# Cache Read
-# -----------------------
-@app.get("/cache/baseprices")
-def list_cached_baseprices(limit: int = 25, db: Session = Depends(get_db)):
-    rows = db.execute(
-        text("""
-            SELECT id, product_uuid, created_at
-            FROM baseprice_cache
-            ORDER BY id DESC
-            LIMIT :limit
-        """),
-        {"limit": limit}
-    ).mappings().all()
-
-    return {"count": len(rows), "entities": [dict(r) for r in rows]}
-
-@app.get("/cache/baseprices/{product_uuid}")
-def get_cached_baseprices(product_uuid: str, db: Session = Depends(get_db)):
-    row = db.execute(
-        text("""
-            SELECT id, product_uuid, created_at, payload
-            FROM baseprice_cache
-            WHERE product_uuid = :product_uuid
-            ORDER BY id DESC
-            LIMIT 1
-        """),
-        {"product_uuid": product_uuid}
-    ).mappings().first()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="No cache found for that product_uuid")
-
-    out = dict(row)
-    try:
-        out["payload"] = json.loads(out["payload"])
-    except Exception:
-        pass
-
-    return out
+    return four_over_get("/whoami")

@@ -1,64 +1,96 @@
 # fourover.py
-import hashlib
+from __future__ import annotations
+
 import hmac
-import time
-import requests
+import hashlib
 from urllib.parse import urlencode
 
-from config import FOUR_OVER_BASE_URL, FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY
+import requests
+from config import settings
+
+
+class FourOverError(Exception):
+    pass
+
+
+def _mask(s: str, keep: int = 4) -> str:
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "*" * (len(s) - keep)
 
 
 class FourOverClient:
-    def __init__(self, base_url: str = FOUR_OVER_BASE_URL, apikey: str = FOUR_OVER_APIKEY, private_key: str = FOUR_OVER_PRIVATE_KEY):
-        self.base_url = (base_url or "").rstrip("/")
-        self.apikey = apikey or ""
-        self.private_key = private_key or ""
+    """
+    Canonical signing pattern you previously saw in your debug output:
+      canonical = "/whoami?apikey=XXX&k=v" (sorted query params, no signature)
+      signature = HMAC_SHA256(private_key, canonical).hexdigest()
+    Request:
+      GET {base}{path}?apikey=...&...&signature=...
+    """
 
-        if not self.base_url:
-            raise ValueError("FOUR_OVER_BASE_URL is missing")
-        if not self.apikey:
-            raise ValueError("FOUR_OVER_APIKEY is missing")
-        if not self.private_key:
-            raise ValueError("FOUR_OVER_PRIVATE_KEY is missing")
+    def __init__(self, base_url=None, apikey=None, private_key=None):
+        self.base_url = (base_url or settings.FOUR_OVER_BASE_URL).rstrip("/")
+        self.apikey = apikey or settings.FOUR_OVER_APIKEY
+        self.private_key = private_key or settings.FOUR_OVER_PRIVATE_KEY
+
+        if not self.apikey or not self.private_key:
+            raise FourOverError(
+                f"Missing 4over credentials. "
+                f"FOUR_OVER_APIKEY='{_mask(self.apikey)}' FOUR_OVER_PRIVATE_KEY='{_mask(self.private_key)}'"
+            )
+
+    def _canonical(self, path: str, params: dict | None) -> str:
+        qp = {"apikey": self.apikey}
+        if params:
+            for k, v in params.items():
+                if v is None or k == "signature":
+                    continue
+                qp[k] = v
+
+        query = urlencode(sorted(qp.items()), doseq=True)
+        return f"{path}?{query}" if query else path
 
     def _sign(self, canonical: str) -> str:
-        # 4over expects HMAC SHA256 signature of the canonical path+query string
-        # canonical example: "/whoami?apikey=XXXXX"
-        digest = hmac.new(self.private_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
-        return digest
+        return hmac.new(
+            self.private_key.encode("utf-8"),
+            canonical.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
 
     def request(self, method: str, path: str, params: dict | None = None, json: dict | None = None, timeout: int = 30):
-        method = method.upper()
-        params = params.copy() if params else {}
+        if not path.startswith("/"):
+            path = "/" + path
 
-        # Ensure apikey is always present
-        params["apikey"] = self.apikey
-
-        # Build canonical string for signing (path + ?query)
-        query = urlencode(params)
-        canonical = f"{path}?{query}" if query else path
-
+        canonical = self._canonical(path, params)
         signature = self._sign(canonical)
 
-        # 4over uses signature as query param
-        params["signature"] = signature
+        final_params = {"apikey": self.apikey, "signature": signature}
+        if params:
+            for k, v in params.items():
+                if v is None or k == "signature":
+                    continue
+                final_params[k] = v
 
         url = f"{self.base_url}{path}"
+        resp = requests.request(method.upper(), url, params=final_params, json=json, timeout=timeout)
 
-        r = requests.request(method, url, params=params, json=json, timeout=timeout)
-        return r
+        debug = {
+            "url": resp.url,
+            "base": self.base_url,
+            "canonical": canonical,
+            "signature_prefix": signature[:10],
+            "status_code": resp.status_code,
+        }
+
+        if resp.status_code >= 400:
+            raise FourOverError(f"4over request failed: {debug} body={resp.text[:800]}")
+
+        try:
+            return resp.json()
+        except Exception:
+            return {"raw": resp.text, "debug": debug}
 
     def whoami(self):
         return self.request("GET", "/whoami")
-
-    def categories(self):
-        return self.request("GET", "/printproducts/categories")
-
-    def category_products(self, category_uuid: str, page: int = 1):
-        return self.request("GET", f"/printproducts/categories/{category_uuid}/products", params={"page": page})
-
-    def product_options(self, product_uuid: str):
-        return self.request("GET", f"/printproducts/products/{product_uuid}/options")
-
-    def product_prices(self, product_uuid: str):
-        return self.request("GET", f"/printproducts/products/{product_uuid}/prices")

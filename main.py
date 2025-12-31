@@ -2,13 +2,12 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from fourover_client import FourOverError, whoami, product_baseprices, build_signed_url
-from db import ensure_schema, insert_baseprice_cache, list_baseprice_cache, latest_baseprice_cache
+from fourover_client import FourOverError, product_baseprices, whoami
 
 APP_VERSION = {
     "service": "catdi-4over-connector",
     "phase": "0.9",
-    "build": "ROOT_MAIN_PY_V10_AUTH_NO_TIMESTAMP_DB_SAFE",
+    "build": "AUTH_FIRST_METHOD_SIGNATURE_V1",
 }
 
 app = FastAPI(title="Catdi 4over Connector", version="0.9")
@@ -22,20 +21,6 @@ def version():
 @app.get("/ping")
 def ping():
     return {"ok": True}
-
-
-@app.get("/db/ping")
-def db_ping():
-    return {"ok": True}
-
-
-@app.post("/db/init")
-def db_init():
-    try:
-        ensure_schema()
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "DB init failed", "message": str(e)})
 
 
 def _four_over_error_response(e: FourOverError):
@@ -53,69 +38,60 @@ def _four_over_error_response(e: FourOverError):
     )
 
 
-@app.get("/4over/debug/whoami")
-def debug_whoami():
-    """
-    Safe debug endpoint: shows EXACT canonical + signature + url we are generating.
-    This should NEVER 502.
-    """
-    try:
-        return build_signed_url("/whoami")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "debug failed", "message": str(e)})
-
-
 @app.get("/4over/whoami")
-def four_over_whoami():
+def four_over_whoami(key_mode: str = Query("hexdigest", pattern="^(hexdigest|digest|hexbytes)$")):
+    """
+    key_mode:
+      - hexdigest: matches 4over doc example literally
+      - digest / hexbytes: alternates in case 4over expects bytes-style key
+    """
     try:
-        return whoami()
+        return whoami(key_mode=key_mode)
     except FourOverError as e:
         return _four_over_error_response(e)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": "unexpected", "message": str(e)})
 
 
 @app.get("/doorhangers/product/{product_uuid}/baseprices")
-def doorhangers_baseprices(product_uuid: str):
+def doorhangers_baseprices(
+    product_uuid: str,
+    key_mode: str = Query("hexdigest", pattern="^(hexdigest|digest|hexbytes)$"),
+):
     try:
-        return product_baseprices(product_uuid)
-    except FourOverError as e:
-        return _four_over_error_response(e)
-
-
-@app.post("/doorhangers/import/{product_uuid}")
-def import_doorhanger_baseprices(product_uuid: str):
-    """
-    Fetch baseprices from 4over and cache into Postgres.
-    Note: if 4over auth fails, we return that error and DO NOT insert empty payload.
-    """
-    try:
-        ensure_schema()
-        payload = product_baseprices(product_uuid)
-        cache_id = insert_baseprice_cache(product_uuid, payload)
-        return {"ok": True, "product_uuid": product_uuid, "cache_id": cache_id}
+        return product_baseprices(product_uuid, key_mode=key_mode)
     except FourOverError as e:
         return _four_over_error_response(e)
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "db error", "message": str(e)})
+        raise HTTPException(status_code=500, detail={"error": "unexpected", "message": str(e)})
 
 
-@app.get("/cache/baseprices")
-def cache_baseprices(limit: int = Query(25, ge=1, le=200)):
-    try:
-        ensure_schema()
-        return {"entities": list_baseprice_cache(limit=limit)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "cache list failed", "message": str(e)})
+@app.get("/4over/debug/auth-matrix")
+def auth_matrix():
+    """
+    Calls /whoami 3 ways and reports:
+      - which key derivation works (if any)
+      - status codes + short body snippet
+    This endpoint must NEVER crash the app.
+    """
+    results = []
+    for mode in ["hexdigest", "digest", "hexbytes"]:
+        try:
+            data = whoami(key_mode=mode)
+            results.append({"key_mode": mode, "ok": True, "status": 200, "data": data})
+        except FourOverError as e:
+            snippet = (e.body or "")[:200]
+            results.append(
+                {
+                    "key_mode": mode,
+                    "ok": False,
+                    "status": e.status,
+                    "url": e.url,
+                    "canonical": e.canonical,
+                    "body_snippet": snippet,
+                }
+            )
+        except Exception as e:
+            results.append({"key_mode": mode, "ok": False, "status": "exception", "error": str(e)})
 
-
-@app.get("/cache/baseprices/{product_uuid}")
-def cache_baseprices_by_product(product_uuid: str):
-    try:
-        ensure_schema()
-        row = latest_baseprice_cache(product_uuid)
-        if not row:
-            raise HTTPException(status_code=404, detail="Not Found")
-        return row
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "cache fetch failed", "message": str(e)})
+    return {"results": results}

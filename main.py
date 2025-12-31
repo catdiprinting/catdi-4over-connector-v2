@@ -10,10 +10,9 @@ from fourover_client import FourOverError
 from db import SessionLocal, engine
 from models import Base, BasePriceCache
 
-
 SERVICE_NAME = "catdi-4over-connector"
 PHASE = "0.9"
-BUILD = "ROOT_MAIN_PY_V5_SINGLE_AUTH"
+BUILD = "ROOT_MAIN_PY_V6_ROOT_STABLE"
 
 
 app = FastAPI(title=SERVICE_NAME, version=PHASE)
@@ -25,14 +24,6 @@ app = FastAPI(title=SERVICE_NAME, version=PHASE)
 def safe_error(detail: dict, status_code: int = 500):
     """Return consistent error payloads (prevents Railway 502 crash loops)."""
     return JSONResponse(status_code=status_code, content={"detail": detail})
-
-
-def db_session():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 # -----------------------------
@@ -68,15 +59,22 @@ def db_ping():
 def db_init():
     """
     Creates tables safely.
-    If they already exist, don't crash.
+    Also creates the index using IF NOT EXISTS so we never crash on duplicates.
     """
     try:
+        # Create table(s)
         Base.metadata.create_all(bind=engine)
+
+        # Create index safely (Postgres + SQLite both support IF NOT EXISTS)
+        with engine.connect() as conn:
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_baseprice_cache_product_uuid ON baseprice_cache (product_uuid)"
+            )
+
         return {"ok": True}
     except Exception as e:
-        # Avoid crashing the app into 502
         return safe_error(
-            {"error": "db init failed", "message": str(e)},
+            {"error": "db init failed", "message": str(e), "trace": traceback.format_exc()},
             status_code=500,
         )
 
@@ -87,8 +85,7 @@ def db_init():
 @app.get("/4over/whoami")
 def whoami():
     try:
-        data = fourover.whoami()
-        return data
+        return fourover.whoami()
     except FourOverError as e:
         return safe_error(
             {
@@ -148,7 +145,6 @@ def doorhanger_import(product_uuid: str):
             )
 
         with SessionLocal() as db:
-            # Create a cache row
             row = BasePriceCache(product_uuid=product_uuid, payload=data)
             db.add(row)
             db.commit()
@@ -168,10 +164,7 @@ def doorhanger_import(product_uuid: str):
             status_code=e.status,
         )
     except SQLAlchemyError as e:
-        return safe_error(
-            {"error": "db error", "message": str(e)},
-            status_code=500,
-        )
+        return safe_error({"error": "db error", "message": str(e)}, status_code=500)
     except Exception as e:
         return safe_error(
             {"error": "unexpected error", "message": str(e), "trace": traceback.format_exc()},
@@ -227,7 +220,9 @@ def cache_baseprices_by_product(product_uuid: str):
             row = db.execute(stmt).scalars().first()
 
             if not row:
-                raise HTTPException(status_code=404, detail={"error": "not found", "product_uuid": product_uuid})
+                raise HTTPException(
+                    status_code=404, detail={"error": "not found", "product_uuid": product_uuid}
+                )
 
             return {"ok": True, "id": row.id, "product_uuid": row.product_uuid, "payload": row.payload}
 

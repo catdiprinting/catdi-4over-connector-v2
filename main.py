@@ -8,7 +8,7 @@ from db import ensure_schema, insert_baseprice_cache, list_baseprice_cache, late
 APP_VERSION = {
     "service": "catdi-4over-connector",
     "phase": "0.9",
-    "build": "ROOT_MAIN_PY_V8_LOCKED_SIGNER_NO_TIMESTAMP",
+    "build": "ROOT_MAIN_PY_V8_LOCKED_AUTH_AND_DB",
 }
 
 app = FastAPI(title="Catdi 4over Connector", version="0.9")
@@ -38,14 +38,15 @@ def db_init():
         raise HTTPException(status_code=500, detail=f"DB init failed: {e}")
 
 
+# ---- 4over Debug ----
 @app.get("/4over/debug/whoami")
-def debug_whoami_signature():
-    """
-    Debug only: shows what we are signing, without exposing private key.
-    Confirms canonical is stable (/whoami?apikey=catdi) and includes signature hash.
-    """
-    signed = build_signed_url("/whoami", use_timestamp=False)
-    return {"canonical": signed.canonical, "url": signed.url, "signature": signed.signature}
+def debug_whoami():
+    signed = build_signed_url("/whoami")
+    return {
+        "canonical": signed["canonical"],
+        "url": signed["url"],
+        "signature": signed["signature"],
+    }
 
 
 @app.get("/4over/whoami")

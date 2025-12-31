@@ -1,14 +1,12 @@
+# config.py
 import os
 
 FOUR_OVER_BASE_URL = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
-FOUR_OVER_APIKEY = os.getenv("FOUR_OVER_APIKEY", "")
-FOUR_OVER_PRIVATE_KEY = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
+FOUR_OVER_APIKEY = os.getenv("FOUR_OVER_APIKEY", "").strip()
+FOUR_OVER_PRIVATE_KEY = os.getenv("FOUR_OVER_PRIVATE_KEY", "").strip()
 
-missing = []
-if not FOUR_OVER_APIKEY:
-    missing.append("FOUR_OVER_APIKEY")
-if not FOUR_OVER_PRIVATE_KEY:
-    missing.append("FOUR_OVER_PRIVATE_KEY")
-if missing:
-    raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db").strip()
+
+# Normalize Railway/Heroku style
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)

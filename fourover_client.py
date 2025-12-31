@@ -2,8 +2,6 @@
 import hashlib
 import hmac
 import time
-from dataclasses import dataclass
-from typing import Any
 from urllib.parse import urlencode
 
 import requests
@@ -20,74 +18,53 @@ class FourOverError(RuntimeError):
         self.canonical = canonical
 
 
-def _clean(s: str | None) -> str:
-    return (s or "").strip()
+def _hmac_sha256_hex(key: str, message: str) -> str:
+    return hmac.new(
+        key.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
-def _base_url() -> str:
-    return _clean(FOUR_OVER_BASE_URL).rstrip("/")
+def build_signed_url(path: str, params: dict | None = None) -> dict:
+    """
+    4over signature is based on the canonical path + querystring (excluding signature itself).
+    We also include timestamp to prevent replay / match their auth expectations.
+    """
+    if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
+        raise FourOverError(
+            0, "", "Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY env vars", path
+        )
+
+    q = dict(params or {})
+    q["apikey"] = FOUR_OVER_APIKEY
+    q["timestamp"] = int(time.time())
+
+    # canonical excludes signature
+    canonical = f"{path}?{urlencode(q)}"
+    signature = _hmac_sha256_hex(FOUR_OVER_PRIVATE_KEY, canonical)
+
+    q["signature"] = signature
+    url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(q)}"
+
+    return {"url": url, "canonical": canonical, "signature": signature}
 
 
-def _sorted_query(params: dict[str, Any]) -> str:
-    items = sorted(params.items(), key=lambda kv: kv[0])
-    return urlencode(items, doseq=True)
+def get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
+    signed = build_signed_url(path, params=params)
+    url = signed["url"]
+    canonical = signed["canonical"]
 
-
-def _signature_sha256(canonical: str) -> str:
-    key = _clean(FOUR_OVER_PRIVATE_KEY).encode("utf-8")
-    msg = canonical.encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()
-
-
-@dataclass
-class SignedRequest:
-    url: str
-    canonical: str
-    signature: str
-
-
-def build_signed_url(
-    path: str,
-    params: dict[str, Any] | None = None,
-    *,
-    use_timestamp: bool = False,  # IMPORTANT: default OFF to match your working style
-) -> SignedRequest:
-    apikey = _clean(FOUR_OVER_APIKEY)
-    pkey = _clean(FOUR_OVER_PRIVATE_KEY)
-    if not apikey or not pkey:
-        raise FourOverError(0, "", "Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY", path)
-
-    q: dict[str, Any] = dict(params or {})
-    q["apikey"] = apikey
-
-    if use_timestamp and "timestamp" not in q:
-        q["timestamp"] = int(time.time())
-
-    canonical = f"{path}?{_sorted_query(q)}"
-    signature = _signature_sha256(canonical)
-
-    q2 = dict(q)
-    q2["signature"] = signature
-
-    url = f"{_base_url()}{path}?{_sorted_query(q2)}"
-    return SignedRequest(url=url, canonical=canonical, signature=signature)
-
-
-def get(path: str, params: dict[str, Any] | None = None, timeout: int = 30, *, use_timestamp: bool = False) -> dict:
-    signed = build_signed_url(path, params, use_timestamp=use_timestamp)
-    r = requests.get(signed.url, timeout=timeout)
-
+    r = requests.get(url, timeout=timeout)
     if r.status_code >= 400:
-        raise FourOverError(r.status_code, signed.url, r.text, signed.canonical)
+        raise FourOverError(r.status_code, url, r.text, canonical)
 
     return r.json()
 
 
 def whoami() -> dict:
-    # timestamp OFF to match your proven-working canonical style
-    return get("/whoami", use_timestamp=False)
+    return get("/whoami")
 
 
 def product_baseprices(product_uuid: str) -> dict:
-    # timestamp OFF to match your proven-working canonical style
-    return get(f"/printproducts/products/{product_uuid}/baseprices", use_timestamp=False)
+    return get(f"/printproducts/products/{product_uuid}/baseprices")

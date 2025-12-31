@@ -8,7 +8,7 @@ from db import ensure_schema, insert_baseprice_cache, list_baseprice_cache, late
 APP_VERSION = {
     "service": "catdi-4over-connector",
     "phase": "0.9",
-    "build": "ROOT_MAIN_PY_V8_LOCKED_AUTH_AND_DB",
+    "build": "ROOT_MAIN_PY_V9_SAFE_DEBUG_ENDPOINT",
 }
 
 app = FastAPI(title="Catdi 4over Connector", version="0.9")
@@ -38,15 +38,35 @@ def db_init():
         raise HTTPException(status_code=500, detail=f"DB init failed: {e}")
 
 
-# ---- 4over Debug ----
+# ---- 4over Debug (SAFE) ----
 @app.get("/4over/debug/whoami")
 def debug_whoami():
-    signed = build_signed_url("/whoami")
-    return {
-        "canonical": signed["canonical"],
-        "url": signed["url"],
-        "signature": signed["signature"],
-    }
+    try:
+        signed = build_signed_url("/whoami")
+        return {
+            "canonical": signed["canonical"],
+            "url": signed["url"],
+            "signature": signed["signature"],
+        }
+    except FourOverError as e:
+        # If env vars are missing, you'll see it here instead of a hard 500
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": {
+                    "error": "4over debug failed",
+                    "status": e.status,
+                    "body": e.body,
+                    "canonical": e.canonical,
+                }
+            },
+        )
+    except Exception as e:
+        # Any import/name errors show up here cleanly
+        return JSONResponse(
+            status_code=500,
+            content={"detail": {"error": "debug endpoint crashed", "message": str(e)}},
+        )
 
 
 @app.get("/4over/whoami")
@@ -89,9 +109,6 @@ def doorhangers_baseprices(product_uuid: str):
 
 @app.post("/doorhangers/import/{product_uuid}")
 def import_doorhanger_baseprices(product_uuid: str):
-    """
-    Fetch baseprices from 4over and cache into Postgres.
-    """
     try:
         ensure_schema()
         payload = product_baseprices(product_uuid)
@@ -111,7 +128,10 @@ def import_doorhanger_baseprices(product_uuid: str):
             },
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "db error", "message": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "db error", "message": str(e)},
+        )
 
 
 @app.get("/cache/baseprices")
@@ -120,7 +140,10 @@ def cache_baseprices(limit: int = Query(25, ge=1, le=200)):
         ensure_schema()
         return {"entities": list_baseprice_cache(limit=limit)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "cache list failed", "message": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "cache list failed", "message": str(e)},
+        )
 
 
 @app.get("/cache/baseprices/{product_uuid}")
@@ -134,4 +157,7 @@ def cache_baseprices_by_product(product_uuid: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "cache fetch failed", "message": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "cache fetch failed", "message": str(e)},
+        )

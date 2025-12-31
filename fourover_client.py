@@ -27,20 +27,18 @@ def _hmac_sha256_hex(key: str, message: str) -> str:
 
 
 def build_signed_url(path: str, params: dict | None = None) -> dict:
-    """
-    4over signature is based on the canonical path + querystring (excluding signature itself).
-    We also include timestamp to prevent replay / match their auth expectations.
-    """
     if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
         raise FourOverError(
-            0, "", "Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY env vars", path
+            0,
+            "",
+            "Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY env vars",
+            path,
         )
 
     q = dict(params or {})
     q["apikey"] = FOUR_OVER_APIKEY
     q["timestamp"] = int(time.time())
 
-    # canonical excludes signature
     canonical = f"{path}?{urlencode(q)}"
     signature = _hmac_sha256_hex(FOUR_OVER_PRIVATE_KEY, canonical)
 

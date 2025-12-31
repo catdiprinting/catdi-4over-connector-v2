@@ -1,164 +1,84 @@
 # db.py
-import json
+import os
+from datetime import datetime, timezone
+
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
 from config import DATABASE_URL
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def ensure_schema():
+def ensure_schema() -> None:
     """
-    Ensures baseprice_cache exists AND has payload column,
-    and fixes old rows where payload accidentally became NULL.
+    Creates baseprice_cache table if missing and performs a tiny migration if payload column is missing.
+    Safe to run on every request.
     """
-    dialect = engine.dialect.name
-
     with engine.begin() as conn:
-        if dialect == "postgresql":
-            conn.execute(
-                text(
-                    """
-                    CREATE TABLE IF NOT EXISTS baseprice_cache (
-                        id BIGSERIAL PRIMARY KEY,
-                        product_uuid VARCHAR NOT NULL,
-                        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    );
-                    """
-                )
+        # 1) Create table if it doesn't exist (payload included)
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS baseprice_cache (
+                    id SERIAL PRIMARY KEY,
+                    product_uuid VARCHAR NOT NULL,
+                    payload JSONB NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
             )
+        )
 
-            # If table exists but payload column is missing, add it
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE baseprice_cache
-                    ADD COLUMN IF NOT EXISTS payload JSONB;
-                    """
-                )
+        # 2) Migration: add payload column if an older table exists without it
+        conn.execute(
+            text(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name='baseprice_cache'
+                          AND column_name='payload'
+                    ) THEN
+                        ALTER TABLE baseprice_cache ADD COLUMN payload JSONB NULL;
+                    END IF;
+                END$$;
+                """
             )
+        )
 
-            # If created_at missing, add it
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE baseprice_cache
-                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
-                    """
-                )
+        # Optional: helpful index for lookups
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_baseprice_cache_product_uuid
+                ON baseprice_cache (product_uuid);
+                """
             )
-
-            # Backfill any NULLs from earlier drift
-            conn.execute(
-                text(
-                    """
-                    UPDATE baseprice_cache
-                    SET payload = '{}'::jsonb
-                    WHERE payload IS NULL;
-                    """
-                )
-            )
-            conn.execute(
-                text(
-                    """
-                    UPDATE baseprice_cache
-                    SET created_at = NOW()
-                    WHERE created_at IS NULL;
-                    """
-                )
-            )
-
-            # Enforce NOT NULL + default going forward
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE baseprice_cache
-                    ALTER COLUMN payload SET DEFAULT '{}'::jsonb;
-                    """
-                )
-            )
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE baseprice_cache
-                    ALTER COLUMN payload SET NOT NULL;
-                    """
-                )
-            )
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE baseprice_cache
-                    ALTER COLUMN created_at SET DEFAULT NOW();
-                    """
-                )
-            )
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE baseprice_cache
-                    ALTER COLUMN created_at SET NOT NULL;
-                    """
-                )
-            )
-
-            conn.execute(
-                text(
-                    """
-                    CREATE INDEX IF NOT EXISTS ix_baseprice_cache_product_uuid
-                    ON baseprice_cache (product_uuid);
-                    """
-                )
-            )
-
-        else:
-            conn.execute(
-                text(
-                    """
-                    CREATE TABLE IF NOT EXISTS baseprice_cache (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        product_uuid TEXT NOT NULL,
-                        payload TEXT NOT NULL,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                    );
-                    """
-                )
-            )
+        )
 
 
-def insert_baseprice_cache(product_uuid: str, payload_obj: dict) -> int:
-    payload_json = json.dumps(payload_obj)
-
+def insert_baseprice_cache(product_uuid: str, payload: dict) -> int:
+    ensure_schema()
     with engine.begin() as conn:
-        if engine.dialect.name == "postgresql":
-            row = conn.execute(
-                text(
-                    """
-                    INSERT INTO baseprice_cache (product_uuid, payload)
-                    VALUES (:product_uuid, CAST(:payload AS jsonb))
-                    RETURNING id;
-                    """
-                ),
-                {"product_uuid": product_uuid, "payload": payload_json},
-            ).first()
-            return int(row[0])
-        else:
-            row = conn.execute(
-                text(
-                    """
-                    INSERT INTO baseprice_cache (product_uuid, payload)
-                    VALUES (:product_uuid, :payload);
-                    """
-                ),
-                {"product_uuid": product_uuid, "payload": payload_json},
-            )
-            return int(row.lastrowid)
+        row = conn.execute(
+            text(
+                """
+                INSERT INTO baseprice_cache (product_uuid, payload)
+                VALUES (:product_uuid, :payload::jsonb)
+                RETURNING id;
+                """
+            ),
+            {"product_uuid": product_uuid, "payload": payload},
+        ).fetchone()
+        return int(row[0])
 
 
 def list_baseprice_cache(limit: int = 25) -> list[dict]:
+    ensure_schema()
     with engine.begin() as conn:
         rows = conn.execute(
             text(
@@ -172,31 +92,21 @@ def list_baseprice_cache(limit: int = 25) -> list[dict]:
             {"limit": limit},
         ).fetchall()
 
-    out = []
-    for r in rows:
-        payload = r.payload
-        if payload is None:
-            payload = {}
-        elif isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = {"raw": payload}
-
-        out.append(
-            {
-                "id": r.id,
-                "product_uuid": r.product_uuid,
-                "payload": payload,
-                "created_at": str(r.created_at),
-            }
-        )
-    return out
+    return [
+        {
+            "id": r[0],
+            "product_uuid": r[1],
+            "payload": r[2] if r[2] is not None else None,
+            "created_at": r[3].isoformat() if r[3] else None,
+        }
+        for r in rows
+    ]
 
 
 def latest_baseprice_cache(product_uuid: str) -> dict | None:
+    ensure_schema()
     with engine.begin() as conn:
-        r = conn.execute(
+        row = conn.execute(
             text(
                 """
                 SELECT id, product_uuid, payload, created_at
@@ -207,23 +117,14 @@ def latest_baseprice_cache(product_uuid: str) -> dict | None:
                 """
             ),
             {"product_uuid": product_uuid},
-        ).first()
+        ).fetchone()
 
-    if not r:
+    if not row:
         return None
 
-    payload = r.payload
-    if payload is None:
-        payload = {}
-    elif isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            payload = {"raw": payload}
-
     return {
-        "id": r.id,
-        "product_uuid": r.product_uuid,
-        "payload": payload,
-        "created_at": str(r.created_at),
+        "id": row[0],
+        "product_uuid": row[1],
+        "payload": row[2] if row[2] is not None else None,
+        "created_at": row[3].isoformat() if row[3] else None,
     }

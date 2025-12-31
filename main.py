@@ -2,10 +2,14 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from fourover_client import FourOverError, product_baseprices, whoami
+from fourover_client import FourOverError, product_baseprices, whoami, build_signed_url
 from db import ensure_schema, insert_baseprice_cache, list_baseprice_cache, latest_baseprice_cache
 
-APP_VERSION = {"service": "catdi-4over-connector", "phase": "0.9", "build": "ROOT_MAIN_PY_V7_DB_MIGRATION_FIXED"}
+APP_VERSION = {
+    "service": "catdi-4over-connector",
+    "phase": "0.9",
+    "build": "ROOT_MAIN_PY_V8_LOCKED_SIGNER_NO_TIMESTAMP",
+}
 
 app = FastAPI(title="Catdi 4over Connector", version="0.9")
 
@@ -22,7 +26,6 @@ def ping():
 
 @app.get("/db/ping")
 def db_ping():
-    # If this returns, the app is alive. DB validation is in /db/init
     return {"ok": True}
 
 
@@ -33,6 +36,16 @@ def db_init():
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB init failed: {e}")
+
+
+@app.get("/4over/debug/whoami")
+def debug_whoami_signature():
+    """
+    Debug only: shows what we are signing, without exposing private key.
+    Confirms canonical is stable (/whoami?apikey=catdi) and includes signature hash.
+    """
+    signed = build_signed_url("/whoami", use_timestamp=False)
+    return {"canonical": signed.canonical, "url": signed.url, "signature": signed.signature}
 
 
 @app.get("/4over/whoami")
@@ -79,7 +92,7 @@ def import_doorhanger_baseprices(product_uuid: str):
     Fetch baseprices from 4over and cache into Postgres.
     """
     try:
-        ensure_schema()  # safe to call every time (idempotent)
+        ensure_schema()
         payload = product_baseprices(product_uuid)
         cache_id = insert_baseprice_cache(product_uuid, payload)
         return {"ok": True, "product_uuid": product_uuid, "cache_id": cache_id}

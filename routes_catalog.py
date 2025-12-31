@@ -1,76 +1,86 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+
 from db import get_db
-from models import CatalogProduct
-import catalog_sync
+from models import Category, Product
+from fourover_client import fourover_get
 
-router = APIRouter(prefix="/catalog", tags=["catalog"])
+router = APIRouter(prefix="", tags=["catalog"])
 
-@router.post("/sync")
-def sync(pages: int = Query(1, ge=1, le=200), start_offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
-    return catalog_sync.sync_catalog(db=db, pages=pages, start_offset=start_offset)
 
-@router.get("/sync/dryrun")
-def dryrun(pages: int = Query(1, ge=1, le=20), start_offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
-    # same as sync but does not write
-    pulled = 0
-    offset = start_offset
-    enforced_page_size = None
-    total_results = None
-    first_ids = []
-    last_ids = []
+@router.get("/db/ping")
+def db_ping(db: Session = Depends(get_db)):
+    db.execute("SELECT 1")
+    return {"ok": True}
 
-    for i in range(pages):
-        page = catalog_sync.pull_catalog_page(offset=offset, per_page_requested=200)
-        items = page["items"]
-        total_results = page["totalResults"] if page["totalResults"] is not None else total_results
 
-        if enforced_page_size is None:
-            enforced_page_size = page["items_count"] or 0
+@router.get("/4over/whoami")
+def whoami():
+    # 4over endpoint shown in your logs
+    return fourover_get("/whoami")
 
-        ids = []
-        for x in items:
-            pid = x.get("id") or x.get("productid") or x.get("uuid")
-            if pid:
-                ids.append(str(pid))
 
-        if i == 0:
-            first_ids = ids[:10]
-        last_ids = ids[-10:]
+@router.get("/categories")
+def categories(db: Session = Depends(get_db), save: bool = Query(default=False)):
+    """
+    Lists categories. If save=true, stores them in DB (upsert).
+    """
+    res = fourover_get("/printproducts/categories")
+    if not res["ok"]:
+        return res
 
-        pulled += len(items)
+    entities = res["response"].get("entities") or res["response"].get("data") or res["response"]
+    if not isinstance(entities, list):
+        return {"ok": False, "http_code": res["http_code"], "response": res["response"], "debug": res.get("debug")}
 
-        step = page["items_count"] or enforced_page_size or 0
-        if step <= 0:
-            break
-        offset += step
+    if save:
+        for c in entities:
+            uuid = c.get("category_uuid")
+            if not uuid:
+                continue
+            row = db.query(Category).filter(Category.category_uuid == uuid).one_or_none()
+            if not row:
+                row = Category(category_uuid=uuid)
+                db.add(row)
+            row.category_name = c.get("category_name")
+            row.category_description = c.get("category_description")
+        db.commit()
 
-        if total_results is not None and offset >= int(total_results):
-            break
+    return {"ok": True, "count": len(entities), "entities": entities, "debug": res.get("debug")}
 
-    return {
-        "ok": True,
-        "requested_pages": pages,
-        "start_offset": start_offset,
-        "page_size_assumed": enforced_page_size,
-        "pulled_items": pulled,
-        "end_offset": offset,
-        "totalResults": total_results,
-        "sample_first_10_ids": first_ids,
-        "sample_last_10_ids": last_ids,
-        "verdict": "Looks good if pulled_items == pages*page_size_assumed (unless near end) and IDs change."
-    }
 
-@router.get("/groups/search")
-def search_groups(q: str = Query(..., min_length=1), limit: int = Query(25, ge=1, le=200), db: Session = Depends(get_db)):
-    # basic groupname search
-    stmt = (
-        select(CatalogProduct.groupid, CatalogProduct.groupname)
-        .where(CatalogProduct.groupname.ilike(f"%{q}%"))
-        .where(CatalogProduct.groupid.is_not(None))
-        .group_by(CatalogProduct.groupid, CatalogProduct.groupname)
-        .limit(limit)
-    )
-    rows = db.execute(stmt).all()
-    return {"ok": True, "q": q, "results": [{"groupid": r[0], "groupname": r[1]} for r in rows]}
+@router.get("/categories/{category_uuid}/products")
+def category_products(category_uuid: str, db: Session = Depends(get_db), save: bool = Query(default=False)):
+    """
+    Lists products in a category. If save=true, stores in DB (upsert).
+    """
+    res = fourover_get(f"/printproducts/categories/{category_uuid}/products")
+    if not res["ok"]:
+        return res
+
+    entities = res["response"].get("entities") or res["response"].get("data") or res["response"]
+    if not isinstance(entities, list):
+        return {"ok": False, "http_code": res["http_code"], "response": res["response"], "debug": res.get("debug")}
+
+    if save:
+        # Ensure category exists (optional)
+        cat = db.query(Category).filter(Category.category_uuid == category_uuid).one_or_none()
+        if not cat:
+            cat = Category(category_uuid=category_uuid, category_name=None)
+            db.add(cat)
+            db.commit()
+
+        for p in entities:
+            puid = p.get("product_uuid")
+            if not puid:
+                continue
+            row = db.query(Product).filter(Product.product_uuid == puid).one_or_none()
+            if not row:
+                row = Product(product_uuid=puid)
+                db.add(row)
+            row.product_code = p.get("product_code")
+            row.product_description = p.get("product_description")
+            row.category_uuid = category_uuid
+        db.commit()
+
+    return {"ok": True, "count": len(entities), "entities": entities, "debug": res.get("debug")}

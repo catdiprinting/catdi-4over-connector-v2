@@ -1,51 +1,52 @@
 # fourover_client.py
 import os
-import hashlib
 import hmac
+import hashlib
 import requests
 from urllib.parse import urlencode
 
+FOUR_OVER_BASE_URL = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
+FOUR_OVER_APIKEY = os.getenv("FOUR_OVER_APIKEY", "").strip()
+FOUR_OVER_PRIVATE_KEY = os.getenv("FOUR_OVER_PRIVATE_KEY", "").strip()
 
-class FourOverClient:
+def _sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def signature_for_method(method: str) -> str:
     """
-    Docs-based auth (reverted to API docs):
-      signature = HMAC_SHA256(key=SHA256(private_key), msg=HTTP_METHOD)
-    For GET/DELETE: pass apikey + signature in querystring. :contentReference[oaicite:2]{index=2}:contentReference[oaicite:3]{index=3}
+    Per 4over docs: signature = HMAC_SHA256(HTTP_METHOD, SHA256(private_key))
+    i.e. message = "GET" / "POST" etc
+         key     = sha256(private_key)
+    :contentReference[oaicite:1]{index=1}
     """
+    if not FOUR_OVER_PRIVATE_KEY:
+        raise RuntimeError("FOUR_OVER_PRIVATE_KEY is missing")
+    key_hex = _sha256_hex(FOUR_OVER_PRIVATE_KEY)
+    key_bytes = bytes.fromhex(key_hex)
+    msg = method.upper().encode("utf-8")
+    return hmac.new(key_bytes, msg, hashlib.sha256).hexdigest()
 
-    def __init__(self):
-        self.base_url = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
-        self.public_key = os.getenv("FOUR_OVER_APIKEY", "").strip()
-        self.private_key = os.getenv("FOUR_OVER_PRIVATE_KEY", "").strip()
+def get(path: str, params: dict | None = None, timeout: int = 30):
+    if not FOUR_OVER_APIKEY:
+        raise RuntimeError("FOUR_OVER_APIKEY is missing")
 
-        if not self.public_key or not self.private_key:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY and/or FOUR_OVER_PRIVATE_KEY env vars")
+    params = params or {}
+    params["apikey"] = FOUR_OVER_APIKEY
+    params["signature"] = signature_for_method("GET")
 
-        self._hashed_private = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
+    url = f"{FOUR_OVER_BASE_URL}{path}"
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-        self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json"})
+def post(path: str, json_body: dict | None = None, timeout: int = 30):
+    if not FOUR_OVER_APIKEY:
+        raise RuntimeError("FOUR_OVER_APIKEY is missing")
 
-    def _signature_for_method(self, method: str) -> str:
-        msg = method.upper().encode("utf-8")
-        key = self._hashed_private.encode("utf-8")
-        return hmac.new(key, msg, hashlib.sha256).hexdigest()
+    sig = signature_for_method("POST")
+    headers = {"Authorization": f"API {FOUR_OVER_APIKEY}:{sig}"}
+    url = f"{FOUR_OVER_BASE_URL}{path}"
 
-    def get(self, path: str, params: dict | None = None, timeout: int = 30) -> requests.Response:
-        params = dict(params or {})
-        params["apikey"] = self.public_key
-        params["signature"] = self._signature_for_method("GET")
-
-        url = f"{self.base_url}{path}"
-        return self.session.get(url, params=params, timeout=timeout)
-
-    def debug_get_url(self, path: str, params: dict | None = None) -> dict:
-        params = dict(params or {})
-        params["apikey"] = self.public_key
-        params["signature"] = self._signature_for_method("GET")
-        return {
-            "base_url": self.base_url,
-            "path": path,
-            "query": params,
-            "full_url": f"{self.base_url}{path}?{urlencode(params)}",
-        }
+    r = requests.post(url, json=json_body or {}, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.json()

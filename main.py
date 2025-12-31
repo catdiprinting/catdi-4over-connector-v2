@@ -1,62 +1,53 @@
 # main.py
 from fastapi import FastAPI
-from sqlalchemy import text
+from db import Base, engine
+import importlib
 
-from db import engine, Base
-import db as db_module
+app = FastAPI(title="catdi-4over-connector", version="SAFE_BOOT")
 
-app = FastAPI(title="catdi-4over-connector", version="SAFE_AND_STABLE")
-
-# Create tables (safe to call on boot)
+# Ensure tables exist
 Base.metadata.create_all(bind=engine)
-
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "catdi-4over-connector"}
-
+    return {"ok": True, "service": "catdi-4over-connector", "phase": "DOORHANGERS_PRICING_TESTER"}
 
 @app.get("/db/ping")
 def db_ping():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
     return {"ok": True}
-
 
 @app.get("/diag")
 def diag():
-    """
-    SAFE_BOOT import diagnostics so app doesn't hard-crash if a module breaks.
-    """
-    results = {"service": "catdi-4over-connector", "phase": "SAFE_BOOT", "build": "SAFE_BOOT", "imports": {}, "notes": []}
+    checks = {}
+    notes = []
 
-    def _try(name, fn):
+    def try_import(label: str, mod: str):
         try:
-            fn()
-            results["imports"][name] = {"ok": True, "error": ""}
+            importlib.import_module(mod)
+            checks[label] = {"ok": True, "error": ""}
+            return True
         except Exception as e:
-            results["imports"][name] = {"ok": False, "error": str(e)}
-            results["notes"].append(f"{name} import failed - routes depending on it will be disabled")
+            checks[label] = {"ok": False, "error": str(e)}
+            return False
 
-    _try("db.py", lambda: __import__("db"))
-    _try("models.py", lambda: __import__("models"))
-    _try("fourover_client.py", lambda: __import__("fourover_client"))
+    try_import("db.py", "db")
+    models_ok = try_import("models.py", "models")
+    client_ok = try_import("fourover_client.py", "fourover_client")
+    door_ok = try_import("doorhangers.py (router include)", "doorhangers")
 
-    # Try include router(s)
-    try:
-        from doorhangers import router as doorhangers_router
-        app.include_router(doorhangers_router)
-        results["imports"]["doorhangers.py (router include)"] = {"ok": True, "error": ""}
-    except Exception as e:
-        results["imports"]["doorhangers.py (router include)"] = {"ok": False, "error": str(e)}
-        results["notes"].append("doorhangers router failed to include - check error in /diag")
+    if not models_ok:
+        notes.append("models import failed - routes depending on models will be disabled")
+    if not door_ok:
+        notes.append("doorhangers router failed to include - check error in /diag")
 
-    return results
+    return {
+        "service": "catdi-4over-connector",
+        "phase": "SAFE_BOOT",
+        "build": "SAFE_BOOT",
+        "imports": checks,
+        "notes": notes,
+    }
 
-
-# Include routers normally (non-diag path). If they fail, /diag still works.
-try:
-    from doorhangers import router as doorhangers_router
-    app.include_router(doorhangers_router)
-except Exception:
-    pass
+# Include routers (safe)
+from doorhangers import router as doorhangers_router
+app.include_router(doorhangers_router)

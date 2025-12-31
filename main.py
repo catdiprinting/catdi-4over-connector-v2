@@ -10,6 +10,26 @@ from db import (
     latest_baseprice_cache,
 )
 
+# If your /doorhangers/quote and /doorhangers/options endpoints live in doorhangers.py,
+# this mounts them without changing any existing paths.
+try:
+    from doorhangers import router as doorhangers_router  # expects APIRouter() named "router"
+except Exception:
+    doorhangers_router = None
+
+# Optional: if you have catalog routes in routes_catalog.py
+try:
+    from routes_catalog import router as catalog_router
+except Exception:
+    catalog_router = None
+
+# Optional: pricing tester router if it exists as "router"
+try:
+    from pricing_tester import router as pricing_tester_router
+except Exception:
+    pricing_tester_router = None
+
+
 APP_VERSION = {
     "service": "catdi-4over-connector",
     "phase": "0.9",
@@ -40,7 +60,10 @@ def db_init():
         ensure_schema()
         return {"ok": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "DB init failed", "message": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "DB init failed", "message": str(e)},
+        )
 
 
 @app.get("/4over/whoami")
@@ -105,7 +128,10 @@ def import_doorhanger_baseprices(product_uuid: str):
             },
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "db error", "message": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "db error", "message": str(e)},
+        )
 
 
 @app.get("/cache/baseprices")
@@ -114,7 +140,10 @@ def cache_baseprices(limit: int = Query(25, ge=1, le=200)):
         ensure_schema()
         return {"entities": list_baseprice_cache(limit=limit)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "cache list failed", "message": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "cache list failed", "message": str(e)},
+        )
 
 
 @app.get("/cache/baseprices/{product_uuid}")
@@ -128,57 +157,20 @@ def cache_baseprices_by_product(product_uuid: str):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "cache fetch failed", "message": str(e)})
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "cache fetch failed", "message": str(e)},
+        )
 
 
-@app.get("/doorhangers/options")
-def doorhangers_options(product_uuid: str = Query(...)):
-    """
-    Returns available dropdown options (runsizes + colorspecs) from cached baseprices payload.
-    """
-    try:
-        ensure_schema()
-        row = latest_baseprice_cache(product_uuid)
-        if not row:
-            raise HTTPException(status_code=404, detail="Not found (no cached payload for product_uuid)")
+# -----------------------------
+# Routers (non-breaking add-ons)
+# -----------------------------
+if doorhangers_router is not None:
+    app.include_router(doorhangers_router)
 
-        payload = row.get("payload") or {}
-        entities = payload.get("entities") or []
+if catalog_router is not None:
+    app.include_router(catalog_router)
 
-        runsize_map = {}     # {runsize_uuid: runsize}
-        colorspec_map = {}   # {colorspec_uuid: colorspec}
-
-        for e in entities:
-            ru = e.get("runsize_uuid")
-            rv = e.get("runsize")
-            cu = e.get("colorspec_uuid")
-            cv = e.get("colorspec")
-
-            if ru and rv:
-                runsize_map[ru] = rv
-            if cu and cv:
-                colorspec_map[cu] = cv
-
-        # Sort by numeric runsize when possible
-        def _runsize_sort_key(item):
-            _uuid, val = item
-            try:
-                return (0, int(str(val)))
-            except Exception:
-                return (1, str(val))
-
-        runsizes = [{"runsize_uuid": k, "runsize": v} for k, v in sorted(runsize_map.items(), key=_runsize_sort_key)]
-        colorspecs = [{"colorspec_uuid": k, "colorspec": v} for k, v in sorted(colorspec_map.items(), key=lambda x: x[1])]
-
-        return {
-            "ok": True,
-            "product_uuid": product_uuid,
-            "runsizes": runsizes,
-            "colorspecs": colorspecs,
-            "source": {"used_cache": True},
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail={"error": "options failed", "message": str(e)})
+if pricing_tester_router is not None:
+    app.include_router(pricing_tester_router)

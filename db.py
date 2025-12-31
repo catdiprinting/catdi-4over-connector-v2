@@ -1,13 +1,26 @@
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-from config import DATABASE_URL
+# db.py
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
+
+# Railway sometimes provides postgres:// but SQLAlchemy wants postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
 
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
+    connect_args=connect_args,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 def get_db():
     db = SessionLocal()
@@ -15,7 +28,3 @@ def get_db():
         yield db
     finally:
         db.close()
-
-def ping_db():
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))

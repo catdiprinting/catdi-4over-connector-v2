@@ -1,7 +1,6 @@
 # fourover_client.py
 import hashlib
 import hmac
-import time
 from urllib.parse import urlencode
 
 import requests
@@ -18,15 +17,27 @@ class FourOverError(RuntimeError):
         self.canonical = canonical
 
 
-def _hmac_sha256_hex(key: str, message: str) -> str:
-    return hmac.new(
-        key.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+def _signature_sha256(canonical: str) -> str:
+    """
+    IMPORTANT:
+    - This matches the previously working style you showed:
+      canonical example: /whoami?apikey=catdi
+      signature: sha256 HMAC hex (64 chars)
+    - NO timestamp param (your working calls did not include it)
+    """
+    if not FOUR_OVER_PRIVATE_KEY:
+        return ""
+    key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
+    msg = canonical.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
 def build_signed_url(path: str, params: dict | None = None) -> dict:
+    """
+    Returns {canonical, url, signature} for debugging.
+    Canonical excludes signature, includes apikey and any other params.
+    Uses stable param ordering (sorted keys) to avoid signature drift.
+    """
     if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
         raise FourOverError(
             0,
@@ -37,21 +48,23 @@ def build_signed_url(path: str, params: dict | None = None) -> dict:
 
     q = dict(params or {})
     q["apikey"] = FOUR_OVER_APIKEY
-    q["timestamp"] = int(time.time())
 
-    canonical = f"{path}?{urlencode(q)}"
-    signature = _hmac_sha256_hex(FOUR_OVER_PRIVATE_KEY, canonical)
+    # Stable ordering to prevent regressions due to dict ordering differences
+    ordered = [(k, q[k]) for k in sorted(q.keys())]
+    canonical = f"{path}?{urlencode(ordered)}"
 
-    q["signature"] = signature
-    url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(q)}"
+    signature = _signature_sha256(canonical)
 
-    return {"url": url, "canonical": canonical, "signature": signature}
+    ordered_with_sig = ordered + [("signature", signature)]
+    url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(ordered_with_sig)}"
+
+    return {"canonical": canonical, "url": url, "signature": signature}
 
 
 def get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
-    signed = build_signed_url(path, params=params)
-    url = signed["url"]
-    canonical = signed["canonical"]
+    debug = build_signed_url(path, params=params)
+    url = debug["url"]
+    canonical = debug["canonical"]
 
     r = requests.get(url, timeout=timeout)
     if r.status_code >= 400:

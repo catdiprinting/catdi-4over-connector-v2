@@ -1,25 +1,34 @@
 # db.py
-import os
-from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from __future__ import annotations
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, declarative_base
+from config import settings
 
-# Railway sometimes uses postgres:// which SQLAlchemy wants as postgresql://
+
+DATABASE_URL = settings.DATABASE_URL
+
+# Railway sometimes provides postgres://; SQLAlchemy expects postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
 
-engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,   # helps with stale connections
+    connect_args=connect_args,
+)
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 Base = declarative_base()
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+
+def db_select_1() -> None:
+    """True DB ping. Raises if DB connection fails."""
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))

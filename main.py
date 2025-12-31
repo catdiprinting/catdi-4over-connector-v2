@@ -1,79 +1,56 @@
-# main.py
-import json
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
-from config import SERVICE_NAME, PHASE, BUILD
-from db import Base, engine, get_db
-from models import BasePriceCache
-from fourover_client import FourOverClient
+# make sure these imports match YOUR filenames
+from db import SessionLocal
+from models import BasePriceCache  # adjust name if your model differs
 
-app = FastAPI(title="Catdi × 4over Connector", version=PHASE)
+app = FastAPI()
 
-@app.get("/version")
-def version():
-    return {"service": SERVICE_NAME, "phase": PHASE, "build": BUILD}
-
-@app.get("/health")
-def health():
-    # no DB touch - proves the app is running
-    return {"ok": True}
-
-@app.post("/db/init")
-def db_init():
-    # run ONLY when you want to create tables
+def get_db():
+    db = SessionLocal()
     try:
-        Base.metadata.create_all(bind=engine)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB init failed: {str(e)}")
+        yield db
+    finally:
+        db.close()
 
-@app.get("/db/ping")
-def db_ping(db: Session = Depends(get_db)):
-    try:
-        db.execute(text("SELECT 1"))
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB ping failed: {str(e)}")
+@app.get("/cache/baseprices")
+def list_cached_baseprices(limit: int = 50, db: Session = next(get_db())):
+    rows = db.execute(
+        select(BasePriceCache).order_by(BasePriceCache.id.desc()).limit(limit)
+    ).scalars().all()
 
-@app.get("/4over/whoami")
-def whoami():
-    try:
-        client = FourOverClient()
-        return client.get("/whoami")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "count": len(rows),
+        "entities": [
+            {
+                "id": r.id,
+                "product_uuid": r.product_uuid,
+                "created_at": getattr(r, "created_at", None),
+            }
+            for r in rows
+        ],
+    }
 
-@app.get("/doorhangers/product/{product_uuid}/baseprices")
-def doorhanger_baseprices(product_uuid: str):
-    try:
-        client = FourOverClient()
-        return client.get(f"/printproducts/products/{product_uuid}/baseprices")
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+@app.get("/cache/baseprices/{product_uuid}")
+def get_cached_baseprices(product_uuid: str, db: Session = next(get_db())):
+    row = db.execute(
+        select(BasePriceCache).where(BasePriceCache.product_uuid == product_uuid)
+    ).scalars().first()
 
-@app.post("/doorhangers/import/{product_uuid}")
-def doorhanger_import(product_uuid: str, db: Session = Depends(get_db)):
-    # fetch
-    try:
-        client = FourOverClient()
-        payload = client.get(f"/printproducts/products/{product_uuid}/baseprices")
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="No cache found for that product_uuid")
 
-    # store
-    try:
-        row = db.query(BasePriceCache).filter(BasePriceCache.product_uuid == product_uuid).first()
-        if row:
-            row.payload_json = json.dumps(payload)
-        else:
-            row = BasePriceCache(product_uuid=product_uuid, payload_json=json.dumps(payload))
-            db.add(row)
+    # assuming you stored the full 4over response in a JSON/text column like row.payload
+    payload = getattr(row, "payload", None)
+    if payload is None:
+        # if your column has a different name, update this
+        payload = getattr(row, "data", None)
 
-        db.commit()
-        db.refresh(row)
-        return {"ok": True, "product_uuid": product_uuid, "cache_id": row.id}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB write failed: {str(e)}")
+    return {
+        "id": row.id,
+        "product_uuid": row.product_uuid,
+        "payload": payload,
+        "created_at": getattr(row, "created_at", None),
+    }

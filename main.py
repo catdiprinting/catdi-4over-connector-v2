@@ -11,19 +11,27 @@ from fourover_client import FourOverClient
 
 app = FastAPI(title="Catdi × 4over Connector", version=PHASE)
 
-@app.on_event("startup")
-def on_startup():
-    # create tables
-    Base.metadata.create_all(bind=engine)
-
 @app.get("/version")
 def version():
     return {"service": SERVICE_NAME, "phase": PHASE, "build": BUILD}
 
+@app.get("/health")
+def health():
+    # no DB touch - proves the app is running
+    return {"ok": True}
+
+@app.post("/db/init")
+def db_init():
+    # run ONLY when you want to create tables
+    try:
+        Base.metadata.create_all(bind=engine)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB init failed: {str(e)}")
+
 @app.get("/db/ping")
 def db_ping(db: Session = Depends(get_db)):
     try:
-        # works for Postgres + SQLite
         db.execute(text("SELECT 1"))
         return {"ok": True}
     except Exception as e:
@@ -41,28 +49,22 @@ def whoami():
 def doorhanger_baseprices(product_uuid: str):
     try:
         client = FourOverClient()
-        # 4over printproducts baseprices endpoint
         return client.get(f"/printproducts/products/{product_uuid}/baseprices")
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
 @app.post("/doorhangers/import/{product_uuid}")
 def doorhanger_import(product_uuid: str, db: Session = Depends(get_db)):
-    """
-    Pull baseprices from 4over and store raw JSON payload in DB.
-    """
+    # fetch
     try:
         client = FourOverClient()
         payload = client.get(f"/printproducts/products/{product_uuid}/baseprices")
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
+    # store
     try:
-        row = (
-            db.query(BasePriceCache)
-            .filter(BasePriceCache.product_uuid == product_uuid)
-            .first()
-        )
+        row = db.query(BasePriceCache).filter(BasePriceCache.product_uuid == product_uuid).first()
         if row:
             row.payload_json = json.dumps(payload)
         else:
@@ -71,7 +73,6 @@ def doorhanger_import(product_uuid: str, db: Session = Depends(get_db)):
 
         db.commit()
         db.refresh(row)
-
         return {"ok": True, "product_uuid": product_uuid, "cache_id": row.id}
     except Exception as e:
         db.rollback()

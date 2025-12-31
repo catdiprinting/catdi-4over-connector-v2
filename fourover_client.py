@@ -24,24 +24,16 @@ def _clean(s: str | None) -> str:
     return (s or "").strip()
 
 
-def _normalized_base_url() -> str:
-    # Prevent double slashes and subtle signature/url mismatches
+def _base_url() -> str:
     return _clean(FOUR_OVER_BASE_URL).rstrip("/")
 
 
 def _sorted_query(params: dict[str, Any]) -> str:
-    """
-    Deterministic query order is CRITICAL for stable signatures.
-    urlencode() preserves order of the input sequence, so we sort.
-    """
     items = sorted(params.items(), key=lambda kv: kv[0])
     return urlencode(items, doseq=True)
 
 
 def _signature_sha256(canonical: str) -> str:
-    """
-    HMAC-SHA256 hex digest signature.
-    """
     key = _clean(FOUR_OVER_PRIVATE_KEY).encode("utf-8")
     msg = canonical.encode("utf-8")
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
@@ -58,14 +50,8 @@ def build_signed_url(
     path: str,
     params: dict[str, Any] | None = None,
     *,
-    use_timestamp: bool = True,
+    use_timestamp: bool = False,  # IMPORTANT: default OFF to match your working style
 ) -> SignedRequest:
-    """
-    Builds (url, canonical, signature) in a deterministic way.
-
-    canonical = "{path}?{sorted_query_without_signature}"
-    url       = "{base}{path}?{sorted_query_with_signature}"
-    """
     apikey = _clean(FOUR_OVER_APIKEY)
     pkey = _clean(FOUR_OVER_PRIVATE_KEY)
     if not apikey or not pkey:
@@ -75,22 +61,19 @@ def build_signed_url(
     q["apikey"] = apikey
 
     if use_timestamp and "timestamp" not in q:
-        # 4over commonly supports/uses timestamp signing; keep it stable.
         q["timestamp"] = int(time.time())
 
-    # canonical excludes signature
     canonical = f"{path}?{_sorted_query(q)}"
     signature = _signature_sha256(canonical)
 
-    q_with_sig = dict(q)
-    q_with_sig["signature"] = signature
+    q2 = dict(q)
+    q2["signature"] = signature
 
-    base = _normalized_base_url()
-    url = f"{base}{path}?{_sorted_query(q_with_sig)}"
+    url = f"{_base_url()}{path}?{_sorted_query(q2)}"
     return SignedRequest(url=url, canonical=canonical, signature=signature)
 
 
-def get(path: str, params: dict[str, Any] | None = None, timeout: int = 30, *, use_timestamp: bool = True) -> dict:
+def get(path: str, params: dict[str, Any] | None = None, timeout: int = 30, *, use_timestamp: bool = False) -> dict:
     signed = build_signed_url(path, params, use_timestamp=use_timestamp)
     r = requests.get(signed.url, timeout=timeout)
 
@@ -101,9 +84,10 @@ def get(path: str, params: dict[str, Any] | None = None, timeout: int = 30, *, u
 
 
 def whoami() -> dict:
-    # keep timestamp ON for stability across endpoints
-    return get("/whoami", use_timestamp=True)
+    # timestamp OFF to match your proven-working canonical style
+    return get("/whoami", use_timestamp=False)
 
 
 def product_baseprices(product_uuid: str) -> dict:
-    return get(f"/printproducts/products/{product_uuid}/baseprices", use_timestamp=True)
+    # timestamp OFF to match your proven-working canonical style
+    return get(f"/printproducts/products/{product_uuid}/baseprices", use_timestamp=False)

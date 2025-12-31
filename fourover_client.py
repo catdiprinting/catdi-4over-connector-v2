@@ -1,50 +1,48 @@
-# fourover_client.py
 import hashlib
 import hmac
 import requests
-from typing import Any, Dict, Optional
-from config import FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY, FOUR_OVER_BASE_URL
+from urllib.parse import urlencode
 
-class FourOverClient:
+from config import FOUR_OVER_BASE_URL, FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY
+
+
+class FourOverError(RuntimeError):
+    def __init__(self, status: int, url: str, body: str, canonical: str):
+        super().__init__(f"4over request failed ({status})")
+        self.status = status
+        self.url = url
+        self.body = body
+        self.canonical = canonical
+
+
+def signature_for(method: str) -> str:
     """
-    4over auth (per provided PDF):
-    - GET/DELETE: ?apikey={PUBLIC_KEY}&signature={SIGNATURE}
-    - POST/PUT/PATCH: Authorization: API {PUBLIC_KEY}:{SIGNATURE}
-    Signature:
-      signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
+    Docs:
+      signature = HMAC_SHA256(HTTP_METHOD, sha256(private_key))
     """
-    def __init__(self):
-        if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY env vars")
+    m = method.upper().encode("utf-8")
+    key = hashlib.sha256(FOUR_OVER_PRIVATE_KEY.encode("utf-8")).hexdigest().encode("utf-8")
+    return hmac.new(key, m, hashlib.sha256).hexdigest()
 
-        self.public_key = FOUR_OVER_APIKEY.strip()
-        self.private_key = FOUR_OVER_PRIVATE_KEY.strip()
-        self.base_url = FOUR_OVER_BASE_URL
 
-    def _method_signature(self, method: str) -> str:
-        method = method.upper().strip()
-        # key = sha256(private_key) hex, then bytes
-        key_hex = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
-        key_bytes = key_hex.encode("utf-8")
+def get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
+    """
+    GET auth: apikey + signature (no timestamp)  ✅ matches your working whoami calls.
+    """
+    params = params or {}
+    q = {"apikey": FOUR_OVER_APIKEY, **params, "signature": signature_for("GET")}
+    canonical = f"{path}?{urlencode(q)}"
+    url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(q)}"
 
-        sig = hmac.new(key_bytes, method.encode("utf-8"), hashlib.sha256).hexdigest()
-        return sig
+    r = requests.get(url, timeout=timeout)
+    if r.status_code >= 400:
+        raise FourOverError(r.status_code, url, r.text, canonical)
+    return r.json()
 
-    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        params = dict(params or {})
-        params["apikey"] = self.public_key
-        params["signature"] = self._method_signature("GET")
 
-        url = f"{self.base_url}{path}"
-        r = requests.get(url, params=params, timeout=60)
-        r.raise_for_status()
-        return r.json()
+def whoami() -> dict:
+    return get("/whoami")
 
-    def post(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        url = f"{self.base_url}{path}"
-        sig = self._method_signature("POST")
-        headers = {"Authorization": f"API {self.public_key}:{sig}"}
 
-        r = requests.post(url, json=json_body or {}, headers=headers, timeout=60)
-        r.raise_for_status()
-        return r.json()
+def product_baseprices(product_uuid: str) -> dict:
+    return get(f"/printproducts/products/{product_uuid}/baseprices")

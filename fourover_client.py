@@ -1,7 +1,6 @@
 # fourover_client.py
 import hashlib
 import hmac
-import time
 from urllib.parse import urlencode
 
 import requests
@@ -18,14 +17,15 @@ class FourOverError(RuntimeError):
         self.canonical = canonical
 
 
-def _signature(canonical: str) -> str:
+def _signature_sha256(canonical: str) -> str:
     """
-    4over HMAC signature pattern we used in your working builds:
-    signature = HMAC-SHA1(private_key, canonical).hexdigest()
+    Matches your previously working signature style:
+    - canonical looked like: /whoami?apikey=catdi
+    - signature length was 64 hex (sha256)
     """
     key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
     msg = canonical.encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha1).hexdigest()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
 def get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
@@ -39,16 +39,17 @@ def get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
 
     q = dict(params or {})
     q["apikey"] = FOUR_OVER_APIKEY
-    q["timestamp"] = int(time.time())
 
+    # canonical excludes signature
     canonical = f"{path}?{urlencode(q)}"
-    q["signature"] = _signature(canonical)
+    q["signature"] = _signature_sha256(canonical)
 
     url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(q)}"
-
     r = requests.get(url, timeout=timeout)
+
     if r.status_code >= 400:
         raise FourOverError(r.status_code, url, r.text, canonical)
+
     return r.json()
 
 

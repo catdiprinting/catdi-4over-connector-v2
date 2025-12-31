@@ -27,7 +27,7 @@ def signature_for(method: str) -> str:
 
 def get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
     """
-    GET auth: apikey + signature (no timestamp)  ✅ matches your working whoami calls.
+    GET auth: apikey + signature (no timestamp) ✅ matches your working whoami calls.
     """
     params = params or {}
     q = {"apikey": FOUR_OVER_APIKEY, **params, "signature": signature_for("GET")}

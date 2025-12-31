@@ -1,10 +1,6 @@
 # db.py
 import json
-from contextlib import contextmanager
-
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-
 from config import DATABASE_URL
 
 engine = create_engine(
@@ -12,27 +8,11 @@ engine = create_engine(
     pool_pre_ping=True,
 )
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
-
-@contextmanager
-def db_session():
-    db = SessionLocal()
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
 
 def ensure_schema():
     """
-    Ensures baseprice_cache exists AND has the 'payload' column.
-    This prevents the regression you hit:
-    'column "payload" of relation "baseprice_cache" does not exist'
+    Ensures baseprice_cache exists AND has payload column,
+    and fixes old rows where payload accidentally became NULL.
     """
     dialect = engine.dialect.name
 
@@ -44,13 +24,14 @@ def ensure_schema():
                     CREATE TABLE IF NOT EXISTS baseprice_cache (
                         id BIGSERIAL PRIMARY KEY,
                         product_uuid VARCHAR NOT NULL,
-                        payload JSONB NOT NULL,
+                        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                     """
                 )
             )
-            # In case table already existed WITHOUT payload:
+
+            # If table exists but payload column is missing, add it
             conn.execute(
                 text(
                     """
@@ -59,14 +40,71 @@ def ensure_schema():
                     """
                 )
             )
+
+            # If created_at missing, add it
             conn.execute(
                 text(
                     """
                     ALTER TABLE baseprice_cache
-                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
                     """
                 )
             )
+
+            # Backfill any NULLs from earlier drift
+            conn.execute(
+                text(
+                    """
+                    UPDATE baseprice_cache
+                    SET payload = '{}'::jsonb
+                    WHERE payload IS NULL;
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE baseprice_cache
+                    SET created_at = NOW()
+                    WHERE created_at IS NULL;
+                    """
+                )
+            )
+
+            # Enforce NOT NULL + default going forward
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE baseprice_cache
+                    ALTER COLUMN payload SET DEFAULT '{}'::jsonb;
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE baseprice_cache
+                    ALTER COLUMN payload SET NOT NULL;
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE baseprice_cache
+                    ALTER COLUMN created_at SET DEFAULT NOW();
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE baseprice_cache
+                    ALTER COLUMN created_at SET NOT NULL;
+                    """
+                )
+            )
+
             conn.execute(
                 text(
                     """
@@ -77,7 +115,6 @@ def ensure_schema():
             )
 
         else:
-            # SQLite / other: best-effort minimal schema
             conn.execute(
                 text(
                     """
@@ -138,11 +175,14 @@ def list_baseprice_cache(limit: int = 25) -> list[dict]:
     out = []
     for r in rows:
         payload = r.payload
-        if isinstance(payload, str):
+        if payload is None:
+            payload = {}
+        elif isinstance(payload, str):
             try:
                 payload = json.loads(payload)
             except Exception:
-                pass
+                payload = {"raw": payload}
+
         out.append(
             {
                 "id": r.id,
@@ -173,11 +213,13 @@ def latest_baseprice_cache(product_uuid: str) -> dict | None:
         return None
 
     payload = r.payload
-    if isinstance(payload, str):
+    if payload is None:
+        payload = {}
+    elif isinstance(payload, str):
         try:
             payload = json.loads(payload)
         except Exception:
-            pass
+            payload = {"raw": payload}
 
     return {
         "id": r.id,

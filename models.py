@@ -1,11 +1,18 @@
-from sqlalchemy import Column, String, Numeric
+# models.py
+from sqlalchemy import Column, Integer, String, Text
 from db import Base
 
-class ProductBasePrice(Base):
-    __tablename__ = "product_base_prices"
+class Category(Base):
+    __tablename__ = "categories"
+    id = Column(Integer, primary_key=True, index=True)
+    category_uuid = Column(String(64), unique=True, index=True, nullable=False)
+    category_name = Column(String(255), nullable=False)
+    category_description = Column(Text, nullable=True)
 
-    base_price_uuid = Column(String, primary_key=True)
-    product_uuid = Column(String, index=True)
-    runsize = Column(String)
-    colorspec = Column(String)
-    product_baseprice = Column(Numeric)
+class Product(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True, index=True)
+    product_uuid = Column(String(64), unique=True, index=True, nullable=False)
+    product_code = Column(String(128), nullable=True)
+    product_description = Column(Text, nullable=True)
+    category_uuid = Column(String(64), index=True, nullable=True)

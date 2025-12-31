@@ -1,93 +1,30 @@
+# main.py
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, desc, delete
-from sqlalchemy.exc import SQLAlchemyError
-import traceback
 
-import fourover_client as fourover
-from fourover_client import FourOverError
+from fourover_client import FourOverError, whoami, product_baseprices, product_optiongroups
+from db import (
+    ensure_schema,
+    upsert_baseprice_cache,
+    latest_baseprice_cache,
+    list_baseprice_cache,
+)
 
-from db import SessionLocal, engine
-from models import Base, BasePriceCache
+APP_VERSION = {
+    "service": "catdi-4over-connector",
+    "phase": "0.9",
+    "build": "ROOT_MAIN_PY_AUTH_LOCKED_DB_SAFE_SCHEMA_HEALING",
+}
 
-SERVICE_NAME = "catdi-4over-connector"
-PHASE = "0.9"
-BUILD = "ROOT_MAIN_PY_V6_NO_APP_FOLDER_NO_FETCHED_AT"
-
-app = FastAPI(title=SERVICE_NAME, version=PHASE)
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def safe_error(detail: dict, status_code: int = 500):
-    """
-    Return consistent error payloads (prevents Railway 502 crash loops).
-    """
-    return JSONResponse(status_code=status_code, content={"detail": detail})
+app = FastAPI(title="Catdi 4over Connector", version="0.9")
 
 
-def _latest_cache_row(db, product_uuid: str):
-    """
-    Get most recent cache row WITHOUT relying on fetched_at.
-    We order by id desc (works on your current schema).
-    """
-    stmt = (
-        select(BasePriceCache)
-        .where(BasePriceCache.product_uuid == product_uuid)
-        .order_by(desc(BasePriceCache.id))
-        .limit(1)
-    )
-    return db.execute(stmt).scalars().first()
-
-
-def _extract_entities(payload: dict):
-    entities = payload.get("entities", [])
-    if not isinstance(entities, list):
-        return []
-    return entities
-
-
-def _normalize_colorspec(s: str) -> str:
-    return (s or "").strip().replace(" ", "")
-
-
-def _normalize_runsize(s) -> str:
-    return str(s).strip()
-
-
-def _find_match_from_baseprices(payload: dict, runsize: str, colorspec: str):
-    """
-    From cached baseprices payload, find a matching entity for runsize + colorspec.
-    We expect each entity has runsize + colorspec + their uuids.
-    """
-    entities = _extract_entities(payload)
-    target_runsize = _normalize_runsize(runsize)
-    target_colorspec = _normalize_colorspec(colorspec)
-
-    for e in entities:
-        e_runsize = _normalize_runsize(e.get("runsize") or e.get("runsize_name") or e.get("qty") or "")
-        e_colorspec = _normalize_colorspec(e.get("colorspec") or e.get("colorspec_name") or "")
-        if e_runsize == target_runsize and e_colorspec == target_colorspec:
-            return e
-
-    return None
-
-
-def _apply_markup(value: float, markup_pct: float) -> float:
-    try:
-        pct = float(markup_pct or 0)
-    except Exception:
-        pct = 0.0
-    return round(float(value) * (1.0 + (pct / 100.0)), 2)
-
-
-# -----------------------------
-# Core health/version endpoints
-# -----------------------------
 @app.get("/version")
 def version():
-    return {"service": SERVICE_NAME, "phase": PHASE, "build": BUILD}
+    return APP_VERSION
 
 
 @app.get("/ping")
@@ -95,318 +32,225 @@ def ping():
     return {"ok": True}
 
 
-# -----------------------------
-# DB endpoints
-# -----------------------------
 @app.get("/db/ping")
 def db_ping():
-    try:
-        with engine.connect() as conn:
-            conn.exec_driver_sql("SELECT 1")
-        return {"ok": True}
-    except Exception as e:
-        return safe_error({"error": "db ping failed", "message": str(e)}, status_code=500)
+    return {"ok": True}
 
 
 @app.post("/db/init")
 def db_init():
-    """
-    Creates tables safely.
-    If they already exist, don't crash.
-    """
     try:
-        Base.metadata.create_all(bind=engine)
-        # Return table names for sanity
+        ensure_schema()
         return {"ok": True, "tables": ["baseprice_cache"]}
     except Exception as e:
-        return safe_error({"error": "db init failed", "message": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail={"error": "DB init failed", "message": str(e)})
 
 
-# -----------------------------
-# 4over endpoints
-# -----------------------------
 @app.get("/4over/whoami")
-def whoami():
+def four_over_whoami():
     try:
-        return fourover.whoami()
+        return whoami()
     except FourOverError as e:
-        return safe_error(
-            {
-                "error": "4over_http_error",
-                "status_code": e.status,
-                "url": e.url,
-                "body": e.body,
-                "canonical": getattr(e, "canonical", None),
+        return JSONResponse(
+            status_code=401 if e.status == 401 else 502,
+            content={
+                "detail": {
+                    "error": "4over_http_error",
+                    "status_code": e.status,
+                    "url": e.url,
+                    "body": e.body,
+                    "canonical": e.canonical,
+                }
             },
-            status_code=e.status,
         )
     except Exception as e:
-        return safe_error(
-            {"error": "unexpected_error", "message": str(e), "trace": traceback.format_exc()},
-            status_code=500,
-        )
+        # Prevent hard crashes
+        return JSONResponse(status_code=500, content={"detail": {"error": "server_error", "message": str(e)}})
 
 
-# -----------------------------
-# Doorhangers endpoints
-# -----------------------------
 @app.get("/doorhangers/product/{product_uuid}/baseprices")
-def doorhanger_baseprices(product_uuid: str):
+def doorhangers_baseprices(product_uuid: str):
     try:
-        return fourover.product_baseprices(product_uuid)
+        return product_baseprices(product_uuid)
     except FourOverError as e:
-        return safe_error(
-            {
-                "error": "4over_http_error",
-                "status_code": e.status,
-                "url": e.url,
-                "body": e.body,
-                "canonical": getattr(e, "canonical", None),
+        return JSONResponse(
+            status_code=401 if e.status == 401 else 502,
+            content={
+                "detail": {
+                    "error": "4over_http_error",
+                    "status_code": e.status,
+                    "url": e.url,
+                    "body": e.body,
+                    "canonical": e.canonical,
+                }
             },
-            status_code=e.status,
-        )
-    except Exception as e:
-        return safe_error(
-            {"error": "unexpected_error", "message": str(e), "trace": traceback.format_exc()},
-            status_code=500,
         )
 
 
 @app.post("/doorhangers/import/{product_uuid}")
-def doorhanger_import(product_uuid: str):
+def import_doorhanger_baseprices(product_uuid: str):
     """
-    Fetch baseprices from 4over and REPLACE cache for this product_uuid.
-    (No duplicates.)
-    """
-    try:
-        data = fourover.product_baseprices(product_uuid)
-        entities = _extract_entities(data)
-
-        if len(entities) == 0:
-            return safe_error(
-                {"error": "no_baseprices_returned", "product_uuid": product_uuid, "raw": data},
-                status_code=400,
-            )
-
-        with SessionLocal() as db:
-            # delete old cache rows for this product
-            db.execute(delete(BasePriceCache).where(BasePriceCache.product_uuid == product_uuid))
-            db.commit()
-
-            # insert new cache row
-            row = BasePriceCache(product_uuid=product_uuid, payload=data)
-            db.add(row)
-            db.commit()
-            db.refresh(row)
-
-            return {"ok": True, "product_uuid": product_uuid, "cache_id": row.id, "replaced": True}
-
-    except FourOverError as e:
-        return safe_error(
-            {
-                "error": "4over_http_error",
-                "status_code": e.status,
-                "url": e.url,
-                "body": e.body,
-                "canonical": getattr(e, "canonical", None),
-            },
-            status_code=e.status,
-        )
-    except SQLAlchemyError as e:
-        return safe_error({"error": "db_error", "message": str(e)}, status_code=500)
-    except Exception as e:
-        return safe_error(
-            {"error": "unexpected_error", "message": str(e), "trace": traceback.format_exc()},
-            status_code=500,
-        )
-
-
-@app.get("/doorhangers/options")
-def doorhanger_options(product_uuid: str = Query(...)):
-    """
-    Returns option groups from:
-    GET /printproducts/products/{product_uuid}/optiongroups
-
-    (Matches what you noted as the correct route.)
+    Fetch baseprices from 4over and UPSERT into Postgres (no duplicates for the same product_uuid).
     """
     try:
-        return fourover.product_optiongroups(product_uuid)
+        ensure_schema()
+        payload = product_baseprices(product_uuid)
+        row = upsert_baseprice_cache(product_uuid, payload)
+        return {"ok": True, "product_uuid": product_uuid, "cache_id": row["id"]}
     except FourOverError as e:
-        return safe_error(
-            {
-                "error": "4over_http_error",
-                "status_code": e.status,
-                "url": e.url,
-                "body": e.body,
-                "canonical": getattr(e, "canonical", None),
+        return JSONResponse(
+            status_code=401 if e.status == 401 else 502,
+            content={
+                "detail": {
+                    "error": "4over_http_error",
+                    "status_code": e.status,
+                    "url": e.url,
+                    "body": e.body,
+                    "canonical": e.canonical,
+                }
             },
-            status_code=e.status,
         )
     except Exception as e:
-        return safe_error(
-            {"error": "unexpected_error", "message": str(e), "trace": traceback.format_exc()},
-            status_code=500,
-        )
+        # Prevent app crash loops -> 502s
+        raise HTTPException(status_code=500, detail={"error": "db error", "message": str(e)})
 
 
-@app.get("/doorhangers/quote")
-def doorhanger_quote(
-    product_uuid: str = Query(...),
-    runsize: str = Query(...),
-    colorspec: str = Query(...),
-    markup_pct: float = Query(0),
-):
-    """
-    Uses cached baseprices to map runsize/colorspec -> UUIDs,
-    then calls 4over productquote endpoint:
-
-    GET /printproducts/productquote?product_uuid=...&colorspec_uuid=...&runsize_uuid=...&turnaroundtime_uuid=...&options[]=...
-    (Per API docs.)
-    """
-    try:
-        with SessionLocal() as db:
-            row = _latest_cache_row(db, product_uuid)
-
-        # Auto-import if missing cache
-        if not row:
-            import_result = doorhanger_import(product_uuid)
-            if isinstance(import_result, JSONResponse):
-                return import_result
-            with SessionLocal() as db:
-                row = _latest_cache_row(db, product_uuid)
-
-        if not row:
-            raise HTTPException(status_code=404, detail={"error": "cache_missing", "product_uuid": product_uuid})
-
-        payload = row.payload if isinstance(row.payload, dict) else {}
-        match = _find_match_from_baseprices(payload, runsize=runsize, colorspec=colorspec)
-
-        if not match:
-            return safe_error(
-                {
-                    "error": "no_matching_combination",
-                    "product_uuid": product_uuid,
-                    "runsize": runsize,
-                    "colorspec": colorspec,
-                    "hint": "Combination must exist in baseprices entities.",
-                },
-                status_code=404,
-            )
-
-        runsize_uuid = match.get("runsize_uuid")
-        colorspec_uuid = match.get("colorspec_uuid")
-        turnaround_uuid = (
-            match.get("turnaroundtime_uuid")
-            or match.get("turnaround_uuid")
-        )
-
-        if not (runsize_uuid and colorspec_uuid and turnaround_uuid):
-            return safe_error(
-                {
-                    "error": "missing_required_uuids_in_baseprices_entity",
-                    "have": {
-                        "runsize_uuid": bool(runsize_uuid),
-                        "colorspec_uuid": bool(colorspec_uuid),
-                        "turnaround_uuid": bool(turnaround_uuid),
-                    },
-                    "entity_keys": sorted(list(match.keys())),
-                },
-                status_code=500,
-            )
-
-        # No options chosen yet (we’ll add later).
-        quote = fourover.product_quote(
-            product_uuid=product_uuid,
-            runsize_uuid=runsize_uuid,
-            colorspec_uuid=colorspec_uuid,
-            turnaround_uuid=turnaround_uuid,
-            option_uuids=[],
-        )
-
-        # Apply markup to total_price if present
-        total = quote.get("total_price")
-        try:
-            total_val = float(total)
-        except Exception:
-            total_val = None
-
-        if total_val is not None:
-            quote["total_price_with_markup"] = _apply_markup(total_val, markup_pct)
-            quote["markup_pct"] = float(markup_pct)
-
-        quote["resolved"] = {
-            "runsize": runsize,
-            "colorspec": colorspec,
-            "runsize_uuid": runsize_uuid,
-            "colorspec_uuid": colorspec_uuid,
-            "turnaround_uuid": turnaround_uuid,
-        }
-        return quote
-
-    except FourOverError as e:
-        return safe_error(
-            {
-                "error": "4over_http_error",
-                "status_code": e.status,
-                "url": e.url,
-                "body": e.body,
-                "canonical": getattr(e, "canonical", None),
-            },
-            status_code=e.status,
-        )
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        return safe_error(
-            {"error": "unexpected_error", "message": str(e), "trace": traceback.format_exc()},
-            status_code=500,
-        )
-
-
-# -----------------------------
-# Cache debug endpoints (optional but handy)
-# -----------------------------
 @app.get("/cache/baseprices")
 def cache_baseprices(limit: int = Query(25, ge=1, le=200)):
     try:
-        with SessionLocal() as db:
-            stmt = select(BasePriceCache).order_by(desc(BasePriceCache.id)).limit(limit)
-            rows = db.execute(stmt).scalars().all()
-
-            return {
-                "ok": True,
-                "count": len(rows),
-                "items": [
-                    {
-                        "id": r.id,
-                        "product_uuid": r.product_uuid,
-                        "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
-                    }
-                    for r in rows
-                ],
-            }
+        ensure_schema()
+        return {"entities": list_baseprice_cache(limit=limit)}
     except Exception as e:
-        return safe_error(
-            {"error": "cache_list_failed", "message": str(e), "trace": traceback.format_exc()},
-            status_code=500,
-        )
+        raise HTTPException(status_code=500, detail={"error": "cache list failed", "message": str(e)})
 
 
 @app.get("/cache/baseprices/{product_uuid}")
 def cache_baseprices_by_product(product_uuid: str):
     try:
-        with SessionLocal() as db:
-            row = _latest_cache_row(db, product_uuid)
-
-            if not row:
-                raise HTTPException(status_code=404, detail={"error": "not_found", "product_uuid": product_uuid})
-
-            return {"ok": True, "id": row.id, "product_uuid": row.product_uuid, "payload": row.payload}
-
-    except HTTPException as he:
-        raise he
+        ensure_schema()
+        row = latest_baseprice_cache(product_uuid)
+        if not row:
+            raise HTTPException(status_code=404, detail="Not found")
+        return row
+    except HTTPException:
+        raise
     except Exception as e:
-        return safe_error(
-            {"error": "cache_fetch_failed", "message": str(e), "trace": traceback.format_exc()},
-            status_code=500,
+        raise HTTPException(status_code=500, detail={"error": "cache fetch failed", "message": str(e)})
+
+
+@app.get("/doorhangers/options")
+def doorhangers_options(product_uuid: str = Query(..., min_length=10)):
+    """
+    Returns parsed optiongroups (sizes, stocks, coatings, turnarounds, etc.)
+    directly from 4over (or later: cache these too).
+    """
+    try:
+        data = product_optiongroups(product_uuid)
+        # NOTE: we keep this as raw for now; you can normalize later
+        return {"ok": True, "product_uuid": product_uuid, "optiongroups": data.get("entities", []), "source": {"used_cache": False}}
+    except FourOverError as e:
+        return JSONResponse(
+            status_code=401 if e.status == 401 else 502,
+            content={
+                "detail": {
+                    "error": "4over_http_error",
+                    "status_code": e.status,
+                    "url": e.url,
+                    "body": e.body,
+                    "canonical": e.canonical,
+                }
+            },
         )
+
+
+@app.get("/doorhangers/quote")
+def doorhangers_quote(
+    product_uuid: str = Query(...),
+    runsize: str | None = Query(None),
+    colorspec: str | None = Query(None),
+    runsize_uuid: str | None = Query(None),
+    colorspec_uuid: str | None = Query(None),
+    markup_pct: float = Query(25.0, ge=0.0, le=500.0),
+    auto_import: bool = Query(True),
+):
+    """
+    Quote using cached baseprices. If missing cache and auto_import=True, imports then quotes.
+    """
+    try:
+        ensure_schema()
+
+        cache_row = latest_baseprice_cache(product_uuid)
+        if not cache_row and auto_import:
+            payload = product_baseprices(product_uuid)
+            cache_row = upsert_baseprice_cache(product_uuid, payload)
+
+        if not cache_row:
+            raise HTTPException(status_code=404, detail="No cached baseprices for product_uuid (import first)")
+
+        entities = (cache_row["payload"] or {}).get("entities", [])
+
+        # Find matching baseprice row
+        match = None
+        for r in entities:
+            if runsize_uuid and colorspec_uuid:
+                if r.get("runsize_uuid") == runsize_uuid and r.get("colorspec_uuid") == colorspec_uuid:
+                    match = r
+                    break
+            elif runsize and colorspec:
+                if str(r.get("runsize")) == str(runsize) and str(r.get("colorspec")) == str(colorspec):
+                    match = r
+                    break
+
+        if not match:
+            raise HTTPException(status_code=404, detail="No matching baseprice for the provided runsize/colorspec inputs")
+
+        base_price_raw = str(match.get("product_baseprice", "0"))
+        try:
+            base_price = Decimal(base_price_raw)
+        except InvalidOperation:
+            raise HTTPException(status_code=500, detail=f"Invalid base price from API: {base_price_raw}")
+
+        pct = Decimal(str(markup_pct))
+        sell_price = (base_price * (Decimal("1") + (pct / Decimal("100")))).quantize(Decimal("0.0000000001"))
+
+        # qty from runsize
+        qty = int(str(match.get("runsize", "0")))
+        unit_price = (sell_price / Decimal(qty)).quantize(Decimal("0.0000000001")) if qty else Decimal("0")
+
+        return {
+            "ok": True,
+            "product_uuid": product_uuid,
+            "match": {
+                "runsize_uuid": match.get("runsize_uuid"),
+                "runsize": match.get("runsize"),
+                "colorspec_uuid": match.get("colorspec_uuid"),
+                "colorspec": match.get("colorspec"),
+            },
+            "pricing": {
+                "base_price": str(base_price),
+                "markup_pct": float(markup_pct),
+                "sell_price": str(sell_price),
+                "unit_price": str(unit_price),
+                "qty": qty,
+            },
+            "source": {"used_cache": True, "auto_import": (cache_row is not None and auto_import)},
+        }
+
+    except HTTPException:
+        raise
+    except FourOverError as e:
+        return JSONResponse(
+            status_code=401 if e.status == 401 else 502,
+            content={
+                "detail": {
+                    "error": "4over_http_error",
+                    "status_code": e.status,
+                    "url": e.url,
+                    "body": e.body,
+                    "canonical": e.canonical,
+                }
+            },
+        )
+    except Exception as e:
+        # Prevent crash loops -> Railway 502
+        raise HTTPException(status_code=500, detail={"error": "server_error", "message": str(e)})

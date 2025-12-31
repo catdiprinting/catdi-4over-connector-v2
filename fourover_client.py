@@ -17,27 +17,32 @@ class FourOverError(RuntimeError):
         self.canonical = canonical
 
 
-def _signature_sha256(canonical: str) -> str:
+def _signature_for(method: str, *, key_mode: str = "hexdigest") -> str:
     """
-    IMPORTANT:
-    - This matches the previously working style you showed:
-      canonical example: /whoami?apikey=catdi
-      signature: sha256 HMAC hex (64 chars)
-    - NO timestamp param (your working calls did not include it)
+    4over doc (GET/DELETE):
+      signature = hmac_sha256(HTTP_METHOD, sha256(private_key))
+
+    key_mode variants:
+      - "hexdigest" (matches the doc example literally)
+      - "digest" (sometimes APIs expect raw bytes)
+      - "hexbytes" (bytes.fromhex of hexdigest)
     """
-    if not FOUR_OVER_PRIVATE_KEY:
-        return ""
-    key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
-    msg = canonical.encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+    method_bytes = method.upper().encode("utf-8")
+
+    sha = hashlib.sha256(FOUR_OVER_PRIVATE_KEY.encode("utf-8"))
+    if key_mode == "hexdigest":
+        key = sha.hexdigest().encode("utf-8")
+    elif key_mode == "digest":
+        key = sha.digest()
+    elif key_mode == "hexbytes":
+        key = bytes.fromhex(sha.hexdigest())
+    else:
+        raise ValueError("Invalid key_mode")
+
+    return hmac.new(key, method_bytes, hashlib.sha256).hexdigest()
 
 
-def build_signed_url(path: str, params: dict | None = None) -> dict:
-    """
-    Returns {canonical, url, signature} for debugging.
-    Canonical excludes signature, includes apikey and any other params.
-    Uses stable param ordering (sorted keys) to avoid signature drift.
-    """
+def get(path: str, params: dict | None = None, timeout: int = 20, *, key_mode: str = "hexdigest") -> dict:
     if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
         raise FourOverError(
             0,
@@ -46,36 +51,20 @@ def build_signed_url(path: str, params: dict | None = None) -> dict:
             path,
         )
 
-    q = dict(params or {})
-    q["apikey"] = FOUR_OVER_APIKEY
-
-    # Stable ordering to prevent regressions due to dict ordering differences
-    ordered = [(k, q[k]) for k in sorted(q.keys())]
-    canonical = f"{path}?{urlencode(ordered)}"
-
-    signature = _signature_sha256(canonical)
-
-    ordered_with_sig = ordered + [("signature", signature)]
-    url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(ordered_with_sig)}"
-
-    return {"canonical": canonical, "url": url, "signature": signature}
-
-
-def get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
-    debug = build_signed_url(path, params=params)
-    url = debug["url"]
-    canonical = debug["canonical"]
+    params = params or {}
+    q = {"apikey": FOUR_OVER_APIKEY, **params, "signature": _signature_for("GET", key_mode=key_mode)}
+    canonical = f"{path}?{urlencode(q)}"
+    url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(q)}"
 
     r = requests.get(url, timeout=timeout)
     if r.status_code >= 400:
         raise FourOverError(r.status_code, url, r.text, canonical)
-
     return r.json()
 
 
-def whoami() -> dict:
-    return get("/whoami")
+def whoami(*, key_mode: str = "hexdigest") -> dict:
+    return get("/whoami", key_mode=key_mode)
 
 
-def product_baseprices(product_uuid: str) -> dict:
-    return get(f"/printproducts/products/{product_uuid}/baseprices")
+def product_baseprices(product_uuid: str, *, key_mode: str = "hexdigest") -> dict:
+    return get(f"/printproducts/products/{product_uuid}/baseprices", key_mode=key_mode)

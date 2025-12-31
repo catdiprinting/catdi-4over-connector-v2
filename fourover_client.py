@@ -1,7 +1,10 @@
+# fourover_client.py
 import hashlib
 import hmac
-import requests
+import time
 from urllib.parse import urlencode
+
+import requests
 
 from config import FOUR_OVER_BASE_URL, FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY
 
@@ -15,23 +18,32 @@ class FourOverError(RuntimeError):
         self.canonical = canonical
 
 
-def signature_for(method: str) -> str:
+def _signature(canonical: str) -> str:
     """
-    Docs:
-      signature = HMAC_SHA256(HTTP_METHOD, sha256(private_key))
+    4over HMAC signature pattern we used in your working builds:
+    signature = HMAC-SHA1(private_key, canonical).hexdigest()
     """
-    m = method.upper().encode("utf-8")
-    key = hashlib.sha256(FOUR_OVER_PRIVATE_KEY.encode("utf-8")).hexdigest().encode("utf-8")
-    return hmac.new(key, m, hashlib.sha256).hexdigest()
+    key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
+    msg = canonical.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha1).hexdigest()
 
 
 def get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
-    """
-    GET auth: apikey + signature (no timestamp) ✅ matches your working whoami calls.
-    """
-    params = params or {}
-    q = {"apikey": FOUR_OVER_APIKEY, **params, "signature": signature_for("GET")}
+    if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
+        raise FourOverError(
+            0,
+            "",
+            "Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY env vars",
+            path,
+        )
+
+    q = dict(params or {})
+    q["apikey"] = FOUR_OVER_APIKEY
+    q["timestamp"] = int(time.time())
+
     canonical = f"{path}?{urlencode(q)}"
+    q["signature"] = _signature(canonical)
+
     url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(q)}"
 
     r = requests.get(url, timeout=timeout)

@@ -1,16 +1,18 @@
+# db.py
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-import os
+from config import DATABASE_URL
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
+db_url = DATABASE_URL or "sqlite:///./local.db"
 
-# Railway sometimes provides postgres:// but SQLAlchemy expects postgresql://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Railway sometimes uses postgres://
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
 
 connect_args = {}
-if DATABASE_URL.startswith("sqlite"):
+if db_url.startswith("sqlite:"):
     connect_args = {"check_same_thread": False}
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
+engine = create_engine(db_url, pool_pre_ping=True, connect_args=connect_args)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

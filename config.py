@@ -1,16 +1,21 @@
-# config.py
 import os
 
-def env(name: str, default: str | None = None) -> str | None:
-    v = os.getenv(name, default)
-    if v is not None:
-        v = v.strip()
+def _req(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        raise RuntimeError(f"Missing required env var: {name}")
     return v
 
-FOUR_OVER_APIKEY = env("FOUR_OVER_APIKEY")         # e.g. "catdi"
-FOUR_OVER_PRIVATE_KEY = env("FOUR_OVER_PRIVATE_KEY")
-FOUR_OVER_BASE_URL = env("FOUR_OVER_BASE_URL", "https://api.4over.com")
+# 4over
+FOUR_OVER_BASE_URL = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").strip().rstrip("/")
+FOUR_OVER_APIKEY = _req("FOUR_OVER_APIKEY")          # public key (your apikey / username)
+FOUR_OVER_PRIVATE_KEY = _req("FOUR_OVER_PRIVATE_KEY")# private key
 
-DATABASE_URL = env("DATABASE_URL", "sqlite:///./local.db")
+# DB
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db").strip()
 
-DEBUG = (env("DEBUG", "0") == "1")
+# Safety / debugging
+DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "y", "on")
+SERVICE_NAME = os.getenv("SERVICE_NAME", "catdi-4over-connector")
+PHASE = os.getenv("PHASE", "0.9")
+BUILD = os.getenv("BUILD", "ROOT_MAIN_PY_V4_SAFE_ERRORS")

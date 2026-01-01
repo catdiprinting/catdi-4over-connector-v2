@@ -1,19 +1,16 @@
 """
 fourover_client.py (ROOT FOLDER)
 
-Implements 4over API Key Authentication per 4over docs:
+Backwards-compatible FourOverClient that supports:
 
-- GET/DELETE: pass apikey + signature in querystring
-  ?apikey={PUBLIC_KEY}&signature={SIGNATURE}
+  FourOverClient()
+  FourOverClient(config=FourOverConfig(...))
+  FourOverClient(base_url=..., apikey=..., private_key=..., timeout_seconds=...)
 
-- POST/PUT/PATCH: pass Authorization header
-  Authorization: API {PUBLIC_KEY}:{SIGNATURE}
-
-Signature generation:
+4over Authentication per docs:
+- GET/DELETE: apikey + signature in query
+- POST/PUT/PATCH: Authorization header "API {apikey}:{signature}"
 - signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
-  (i.e., depends on HTTP method ONLY)
-
-Docs: https://api-users.4over.com/?page_id=44
 """
 
 from __future__ import annotations
@@ -40,7 +37,7 @@ class FourOverAuthError(FourOverError):
 
 
 class FourOverHTTPError(FourOverError):
-    """Non-auth HTTP error from 4over."""
+    """Non-auth HTTP error from 4over or network issues."""
 
 
 # -------------------------
@@ -65,7 +62,6 @@ class FourOverConfig:
         if not private_key:
             raise FourOverError("Missing env var FOUR_OVER_PRIVATE_KEY")
 
-        # normalize base url
         base_url = base_url.rstrip("/")
 
         return FourOverConfig(
@@ -75,29 +71,72 @@ class FourOverConfig:
             timeout_seconds=int(os.getenv("FOUR_OVER_TIMEOUT", "30")),
         )
 
+    @staticmethod
+    def from_values(
+        *,
+        base_url: Optional[str] = None,
+        apikey: Optional[str] = None,
+        private_key: Optional[str] = None,
+        timeout_seconds: Optional[int] = None,
+    ) -> "FourOverConfig":
+        b = (base_url or os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").strip().rstrip("/")
+        k = (apikey or os.getenv("FOUR_OVER_APIKEY") or "").strip()
+        pk = (private_key or os.getenv("FOUR_OVER_PRIVATE_KEY") or "").strip()
+        t = int(timeout_seconds or os.getenv("FOUR_OVER_TIMEOUT", "30"))
+
+        if not k:
+            raise FourOverError("Missing apikey / FOUR_OVER_APIKEY")
+        if not pk:
+            raise FourOverError("Missing private_key / FOUR_OVER_PRIVATE_KEY")
+
+        return FourOverConfig(base_url=b, public_key=k, private_key=pk, timeout_seconds=t)
+
 
 # -------------------------
 # Client
 # -------------------------
 
 class FourOverClient:
-    def __init__(self, config: Optional[FourOverConfig] = None):
-        self.config = config or FourOverConfig.from_env()
+    """
+    Backward compatible constructor.
+
+    Old style (your current main.py likely does this):
+      FourOverClient(base_url=..., apikey=..., private_key=...)
+
+    New style:
+      FourOverClient(config=FourOverConfig(...)) or FourOverClient()
+    """
+
+    def __init__(
+        self,
+        config: Optional[FourOverConfig] = None,
+        *,
+        base_url: Optional[str] = None,
+        apikey: Optional[str] = None,
+        private_key: Optional[str] = None,
+        timeout_seconds: Optional[int] = None,
+    ):
+        # If caller passes base_url/apikey/private_key, build config from those.
+        if config is None:
+            if base_url is not None or apikey is not None or private_key is not None or timeout_seconds is not None:
+                config = FourOverConfig.from_values(
+                    base_url=base_url,
+                    apikey=apikey,
+                    private_key=private_key,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                config = FourOverConfig.from_env()
+
+        self.config = config
         self.session = requests.Session()
 
-        # Pre-hash the private key ONE time:
-        # docs show: hash('sha256', $myPrivateKey) used as the HMAC key
-        self._hashed_private_hex = hashlib.sha256(
-            self.config.private_key.encode("utf-8")
-        ).hexdigest()
+        # docs: HMAC key = sha256(private_key) (hex string)
+        self._hashed_private_hex = hashlib.sha256(self.config.private_key.encode("utf-8")).hexdigest()
 
     def _signature_for_method(self, method: str) -> str:
         """
-        4over signature:
-          signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
-
-        Note: In PHP docs, key is the hex string from sha256(private_key).
-        We'll use that same hex string as bytes here.
+        signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
         """
         msg = method.upper().encode("utf-8")
         key = self._hashed_private_hex.encode("utf-8")
@@ -112,7 +151,6 @@ class FourOverClient:
     def _auth_headers_for_write(self, method: str, headers: Optional[Dict[str, str]]) -> Dict[str, str]:
         h = dict(headers or {})
         sig = self._signature_for_method(method)
-        # docs: "Authorization: API {PUBLIC_KEY}:{SIGNATURE}"
         h["Authorization"] = f"API {self.config.public_key}:{sig}"
         return h
 
@@ -154,7 +192,6 @@ class FourOverClient:
         except requests.RequestException as e:
             raise FourOverHTTPError(f"Network error calling 4over: {e}") from e
 
-        # Try parse JSON, but don’t assume it always is
         content_type = (resp.headers.get("content-type") or "").lower()
         body_text = resp.text
 
@@ -179,24 +216,18 @@ class FourOverClient:
 
         return parsed if parsed is not None else body_text
 
-    # Convenience endpoints
+    # Convenience
     def whoami(self) -> Any:
-        # docs show /whoami for auth test
         return self.request("GET", "/whoami")
 
-    def get_categories(self) -> Any:
-        # per docs: GET/printproducts/categories
-        return self.request("GET", "/printproducts/categories")
 
-
-# Optional: tiny self-test helper (won’t run unless called)
 def _debug_signature() -> Dict[str, str]:
     cfg = FourOverConfig.from_env()
     client = FourOverClient(cfg)
     return {
         "base_url": cfg.base_url,
-        "public_key_present": bool(cfg.public_key),
-        "private_key_len": len(cfg.private_key),
+        "public_key_present": str(bool(cfg.public_key)).lower(),
+        "private_key_len": str(len(cfg.private_key)),
         "sig_get": client._signature_for_method("GET"),
         "sig_post": client._signature_for_method("POST"),
     }

@@ -1,51 +1,65 @@
 # fourover_client.py
-import hashlib
+import os
 import hmac
+import hashlib
+import requests
+from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
-import requests
-from config import FOUR_OVER_BASE_URL, FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY
+FOUR_OVER_BASE_URL = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
+FOUR_OVER_APIKEY = os.getenv("FOUR_OVER_APIKEY", "")
+FOUR_OVER_PRIVATE_KEY = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
 
 
-class FourOverError(RuntimeError):
+class FourOverError(Exception):
     def __init__(self, status: int, url: str, body: str, canonical: str):
-        super().__init__(f"4over request failed ({status})")
+        super().__init__(f"4over error {status}")
         self.status = status
         self.url = url
         self.body = body
         self.canonical = canonical
 
 
-def _signature_for(method: str) -> str:
-    """
-    4over doc working mode for YOUR account:
-      signature = hmac_sha256(HTTP_METHOD, sha256(private_key).hexdigest())
-    i.e. key is the SHA256(private_key) rendered as a hex string, encoded as UTF-8 bytes.
-    """
-    method_bytes = method.upper().encode("utf-8")
-    key = hashlib.sha256(FOUR_OVER_PRIVATE_KEY.encode("utf-8")).hexdigest().encode("utf-8")
-    return hmac.new(key, method_bytes, hashlib.sha256).hexdigest()
+def _signature(canonical: str) -> str:
+    # 4over signature is HMAC-SHA256 over canonical path+query using PRIVATE_KEY
+    key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
+    msg = canonical.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
-def get(path: str, params: dict | None = None, timeout: int = 20) -> dict:
+def _get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 25) -> Dict[str, Any]:
     if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
-        raise FourOverError(0, "", "Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY env vars", path)
+        raise FourOverError(
+            status=401,
+            url="",
+            body="Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY",
+            canonical="",
+        )
 
-    q = {"apikey": FOUR_OVER_APIKEY, **(params or {})}
-    q["signature"] = _signature_for("GET")
+    params = params or {}
+    params["apikey"] = FOUR_OVER_APIKEY
 
-    canonical = f"{path}?{urlencode(q)}"
-    url = f"{FOUR_OVER_BASE_URL}{path}?{urlencode(q)}"
+    query = urlencode(params, doseq=True)
+    canonical = f"{path}?{query}" if query else path
+    sig = _signature(canonical)
+
+    url = f"{FOUR_OVER_BASE_URL}{canonical}&signature={sig}" if query else f"{FOUR_OVER_BASE_URL}{canonical}?signature={sig}"
 
     r = requests.get(url, timeout=timeout)
     if r.status_code >= 400:
-        raise FourOverError(r.status_code, url, r.text, canonical)
+        raise FourOverError(status=r.status_code, url=url, body=r.text, canonical=canonical)
+
     return r.json()
 
 
-def whoami() -> dict:
-    return get("/whoami")
+def whoami() -> Dict[str, Any]:
+    return _get("/whoami")
 
 
-def product_baseprices(product_uuid: str) -> dict:
-    return get(f"/printproducts/products/{product_uuid}/baseprices")
+def product_baseprices(product_uuid: str) -> Dict[str, Any]:
+    return _get(f"/printproducts/products/{product_uuid}/baseprices")
+
+
+def product_optiongroups(product_uuid: str) -> Dict[str, Any]:
+    # This returns the structure that includes option groups for size/stock/coating/turnaround, etc.
+    return _get(f"/printproducts/products/{product_uuid}/optiongroups")

@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 from fourover_client import FourOverClient, FourOverAuthError, FourOverHTTPError, FourOverError
 
-# Load local .env only if it exists (Railway doesn't need it)
+# Load local .env only if present (Railway doesn't need it)
 if os.path.exists(".env"):
     load_dotenv()
 
@@ -50,16 +50,8 @@ def whoami():
         return JSONResponse(status_code=500, content={"ok": False, "error": "server_error", "detail": str(e)})
 
 
-# -------------------------------------------------------------------
-# Catalog bridge endpoints (based on old site behavior)
-# -------------------------------------------------------------------
-
 @app.get("/4over/categories")
 def categories(max: int = 200, offset: int = 0):
-    """
-    Old PHP used max/offset pagination. We'll keep that.
-    NOTE: If this 404s, set FOUR_OVER_API_PREFIX=printproducts and redeploy.
-    """
     try:
         data = _client().get("/categories", params={"max": max, "offset": offset})
         return {"ok": True, "data": data}
@@ -87,10 +79,6 @@ def product_detail(product_uuid: str):
 
 @app.get("/4over/products/{product_uuid}/options")
 def product_options(product_uuid: str):
-    """
-    Best-effort endpoint: many 4over products expose options under an options endpoint.
-    If this 404s, we’ll adjust path based on actual 4over response quickly.
-    """
     try:
         data = _client().get(f"/products/{product_uuid}/options")
         return {"ok": True, "data": data}
@@ -100,18 +88,9 @@ def product_options(product_uuid: str):
 
 @app.post("/4over/products/{product_uuid}/quote")
 def product_quote(product_uuid: str, payload: dict):
-    """
-    Old system ultimately calls productquote with the selected option/value IDs.
-    We accept the payload and pass through.
-
-    If this 404s, set FOUR_OVER_API_PREFIX=printproducts and try again, or we adjust this endpoint path.
-    """
     try:
-        # Common patterns include /productquote or /products/{id}/quote
-        # We'll try /productquote first with product_uuid in payload (easy to change later).
         payload = dict(payload or {})
         payload.setdefault("product_uuid", product_uuid)
-
         data = _client().post("/productquote", json=payload)
         return {"ok": True, "data": data}
     except Exception as e:

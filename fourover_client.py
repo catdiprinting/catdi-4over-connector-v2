@@ -1,160 +1,80 @@
-import os
-import json
-import hmac
+from __future__ import annotations
+
 import hashlib
+import hmac
+from urllib.parse import urlencode
+
 import requests
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+
+from config import FOUR_OVER_BASE_URL, FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY
 
 
-class FourOverError(Exception):
-    def __init__(self, status: int, url: str, body: str, canonical: str = ""):
-        super().__init__(f"4over request failed: {status} {url}")
+class FourOverError(RuntimeError):
+    def __init__(self, status: int, url: str, body: str, canonical: str):
+        super().__init__(f"4over request failed ({status})")
         self.status = status
         self.url = url
         self.body = body
         self.canonical = canonical
 
 
-def _env_required(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
+def _require_keys() -> None:
+    if not FOUR_OVER_BASE_URL:
+        raise RuntimeError("FOUR_OVER_BASE_URL is missing")
+    if not FOUR_OVER_APIKEY:
+        raise RuntimeError("FOUR_OVER_APIKEY is missing")
+    if not FOUR_OVER_PRIVATE_KEY:
+        raise RuntimeError("FOUR_OVER_PRIVATE_KEY is missing")
 
 
-def _signature_for_method(http_method: str, private_key: str) -> str:
+def _canonical_query(params: dict) -> str:
+    # Stable ordering matters for signature reproducibility
+    items = sorted((k, str(v)) for k, v in params.items() if v is not None)
+    return urlencode(items)
+
+
+def signature_for_canonical(canonical: str) -> str:
     """
-    Per 4over docs (from your PDF):
-      private_key_hash = sha256(private_key)
-      signature = hmac_sha256(message=HTTP_METHOD, key=private_key_hash)
-    Notes:
-      - docs show using the *hashed* private key as the HMAC key
-      - message is the HTTP method only (GET/POST/PUT/DELETE)
+    Canonical signing approach:
+      signature = HMAC_SHA256(canonical, private_key)
+    (canonical includes path + querystring WITHOUT signature param)
     """
-    method = http_method.upper().strip()
-
-    # docs show sha256(private_key) then use that as key
-    private_key_hash_hex = hashlib.sha256(private_key.encode("utf-8")).hexdigest()
-
-    sig = hmac.new(
-        key=private_key_hash_hex.encode("utf-8"),
-        msg=method.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-
-    return sig
+    key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
+    msg = canonical.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
-@dataclass
 class FourOverClient:
-    base_url: str
-    apikey: str
-    private_key: str
-    timeout: int = 30
+    def __init__(self, base_url: str = FOUR_OVER_BASE_URL):
+        _require_keys()
+        self.base_url = base_url.rstrip("/")
 
-    def request_json(
-        self,
-        method: str,
-        path: str,
-        params: Optional[Dict[str, Any]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        method = method.upper().strip()
-        if not path.startswith("/"):
-            path = "/" + path
+    def request(self, method: str, path: str, params: dict | None = None, timeout: int = 30) -> dict:
+        params = params or {}
+        # Build canonical params excluding signature
+        q = {"apikey": FOUR_OVER_APIKEY, **params}
+        canonical = f"{path}?{_canonical_query(q)}"
+        sig = signature_for_canonical(canonical)
 
-        signature = _signature_for_method(method, self.private_key)
+        # Final URL includes signature
+        q_with_sig = {**q, "signature": sig}
+        url = f"{self.base_url}{path}?{_canonical_query(q_with_sig)}"
 
-        url = self.base_url.rstrip("/") + path
+        r = requests.request(method.upper(), url, timeout=timeout)
+        if r.status_code >= 400:
+            raise FourOverError(r.status_code, url, r.text, canonical)
 
-        # GET/DELETE: signature + apikey go as query params (per docs)
-        req_params = dict(params or {})
-        req_headers: Dict[str, str] = {}
-
-        if method in ("GET", "DELETE"):
-            req_params["apikey"] = self.apikey
-            req_params["signature"] = signature
-        else:
-            # POST/PUT: docs show Authorization header pattern.
-            # We keep apikey as query too for consistency; some endpoints accept both.
-            req_params["apikey"] = self.apikey
-            req_headers["Authorization"] = f"{self.apikey}:{signature}"
-
+        # Some endpoints can return non-json; guard it
         try:
-            resp = requests.request(
-                method=method,
-                url=url,
-                params=req_params,
-                json=json_body,
-                headers=req_headers,
-                timeout=self.timeout,
-            )
-        except Exception as e:
-            raise FourOverError(status=0, url=url, body=str(e), canonical=path)
-
-        body_text = resp.text or ""
-        if resp.status_code >= 400:
-            raise FourOverError(status=resp.status_code, url=resp.url, body=body_text, canonical=path)
-
-        if not body_text:
-            return {}
-
-        try:
-            return resp.json()
+            return r.json()
         except Exception:
-            # if 4over returns non-json
-            return {"raw": body_text}
+            return {"raw": r.text}
 
-    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return self.request_json("GET", path, params=params)
+    def whoami(self) -> dict:
+        return self.request("GET", "/whoami")
 
-    def post(self, path: str, json_body: Optional[Dict[str, Any]] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return self.request_json("POST", path, params=params, json_body=json_body)
+    def product_baseprices(self, product_uuid: str) -> dict:
+        return self.request("GET", f"/printproducts/products/{product_uuid}/baseprices")
 
-
-# Export a "client" object to satisfy any existing router code that does:
-#   from fourover_client import client
-def _build_client() -> FourOverClient:
-    base_url = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com")
-    apikey = _env_required("FOUR_OVER_APIKEY")
-    private_key = _env_required("FOUR_OVER_PRIVATE_KEY")
-    return FourOverClient(base_url=base_url, apikey=apikey, private_key=private_key)
-
-
-client = _build_client()
-
-
-# Convenience functions used by main.py (safe wrappers)
-def whoami() -> Dict[str, Any]:
-    return client.get("/whoami")
-
-
-def product_baseprices(product_uuid: str) -> Dict[str, Any]:
-    return client.get(f"/printproducts/products/{product_uuid}/baseprices")
-
-
-def product_optiongroups(product_uuid: str) -> Dict[str, Any]:
-    return client.get(f"/printproducts/products/{product_uuid}/optiongroups")
-
-
-def auth_debug() -> Dict[str, Any]:
-    """
-    Returns signatures for each method WITHOUT revealing secrets.
-    """
-    priv = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
-    if not priv:
-        return {"ok": False, "error": "FOUR_OVER_PRIVATE_KEY missing"}
-
-    return {
-        "ok": True,
-        "base_url": os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com"),
-        "apikey_present": bool(os.getenv("FOUR_OVER_APIKEY")),
-        "private_key_present": True,
-        "signatures": {
-            "GET": _signature_for_method("GET", priv),
-            "POST": _signature_for_method("POST", priv),
-            "PUT": _signature_for_method("PUT", priv),
-            "DELETE": _signature_for_method("DELETE", priv),
-        },
-    }
+    def product_optiongroups(self, product_uuid: str) -> dict:
+        return self.request("GET", f"/printproducts/products/{product_uuid}/optiongroups")

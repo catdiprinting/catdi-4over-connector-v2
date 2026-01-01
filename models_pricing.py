@@ -1,71 +1,57 @@
-from sqlalchemy import Column, String, Integer, Numeric, Boolean, Text, ForeignKey, Index
-from sqlalchemy.orm import relationship
-from db import Base
+from __future__ import annotations
 
-class PricingProduct(Base):
-    __tablename__ = "pricing_products"
+from datetime import datetime
 
-    product_uuid = Column(String, primary_key=True, index=True)
-    product_code = Column(String, nullable=True, index=True)
-    product_description = Column(Text, nullable=True)
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    UniqueConstraint,
+    Index,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import declarative_base, Mapped, mapped_column
 
-    groups = relationship("PricingOptionGroup", back_populates="product", cascade="all, delete-orphan")
-    prices = relationship("PricingBasePrice", back_populates="product", cascade="all, delete-orphan")
-
-
-class PricingOptionGroup(Base):
-    __tablename__ = "pricing_option_groups"
-
-    product_option_group_uuid = Column(String, primary_key=True, index=True)
-    product_uuid = Column(String, ForeignKey("pricing_products.product_uuid", ondelete="CASCADE"), index=True, nullable=False)
-
-    name = Column(String, nullable=True)
-    minoccurs = Column(Integer, nullable=True)
-    maxoccurs = Column(Integer, nullable=True)
-
-    product = relationship("PricingProduct", back_populates="groups")
-    options = relationship("PricingOption", back_populates="group", cascade="all, delete-orphan")
+Base = declarative_base()
 
 
-class PricingOption(Base):
-    __tablename__ = "pricing_options"
+class BasePriceCache(Base):
+    """
+    ONE row per product_uuid.
+    We UPSERT this row on each import so you never get duplicates.
+    """
+    __tablename__ = "baseprice_cache"
 
-    option_uuid = Column(String, primary_key=True, index=True)
-    group_uuid = Column(String, ForeignKey("pricing_option_groups.product_option_group_uuid", ondelete="CASCADE"), index=True, nullable=False)
-
-    option_name = Column(String, nullable=True)
-    option_description = Column(Text, nullable=True)
-
-    capi_name = Column(String, nullable=True)
-    capi_description = Column(Text, nullable=True)
-
-    # Convenience fields (some 4over options carry these)
-    runsize_uuid = Column(String, nullable=True, index=True)
-    runsize = Column(String, nullable=True)
-    colorspec_uuid = Column(String, nullable=True, index=True)
-    colorspec = Column(String, nullable=True)
-
-    group = relationship("PricingOptionGroup", back_populates="options")
-
-Index("ix_pricing_options_group_uuid", PricingOption.group_uuid)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_uuid: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
 
-class PricingBasePrice(Base):
-    __tablename__ = "pricing_base_prices"
+class BasePriceRow(Base):
+    """
+    Normalized rows for fast quoting: one row per (product_uuid, runsize_uuid, colorspec_uuid).
+    """
+    __tablename__ = "baseprice_rows"
 
-    base_price_uuid = Column(String, primary_key=True, index=True)
-    product_uuid = Column(String, ForeignKey("pricing_products.product_uuid", ondelete="CASCADE"), index=True, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    product_baseprice = Column(Numeric(18, 6), nullable=False)
+    product_uuid: Mapped[str] = mapped_column(String, nullable=False, index=True)
 
-    runsize_uuid = Column(String, nullable=True, index=True)
-    runsize = Column(String, nullable=True)
+    runsize_uuid: Mapped[str] = mapped_column(String, nullable=False)
+    runsize: Mapped[str] = mapped_column(String, nullable=False)
 
-    colorspec_uuid = Column(String, nullable=True, index=True)
-    colorspec = Column(String, nullable=True)
+    colorspec_uuid: Mapped[str] = mapped_column(String, nullable=False)
+    colorspec: Mapped[str] = mapped_column(String, nullable=False)
 
-    can_group_ship = Column(Boolean, default=False)
+    base_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    can_group_ship: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    product = relationship("PricingProduct", back_populates="prices")
+    raw: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
-Index("ix_pricing_base_prices_lookup", PricingBasePrice.product_uuid, PricingBasePrice.runsize_uuid, PricingBasePrice.colorspec_uuid)
+    __table_args__ = (
+        UniqueConstraint("product_uuid", "runsize_uuid", "colorspec_uuid", name="uq_price_combo"),
+        Index("ix_price_lookup", "product_uuid", "runsize", "colorspec"),
+    )

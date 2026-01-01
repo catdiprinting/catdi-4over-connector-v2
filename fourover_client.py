@@ -292,3 +292,9 @@ class FourOverClient:
             "PATCH": _signature_for_method("PATCH", self.private_key),
             "DELETE": _signature_for_method("DELETE", self.private_key),
         }
+# Backwards-compatible singleton (older routers import `client`)
+try:
+    client = FourOverClient.from_env()
+except Exception:
+    # Avoid crashing at import time; routes can instantiate later if needed
+    client = None

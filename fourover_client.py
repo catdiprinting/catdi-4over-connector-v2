@@ -1,48 +1,54 @@
 # fourover_client.py
 """
-4over API Client (Doc-Style Authentication)
+4over API Client — Standard Library Only (NO requests)
 
-Per 4over docs:
-- GET/DELETE: send apikey + signature as query params
-- POST/PUT/PATCH: send Authorization header: "API {apikey}:{signature}"
-- Signature algorithm: HMAC-SHA256(message=HTTP_METHOD, key=SHA256(private_key))
+Auth scheme (per 4over docs you've been using in this project):
+- GET / DELETE: include apikey + signature in query string
+- POST / PUT / PATCH: include Authorization header: "API {apikey}:{signature}"
+- Signature algorithm:
+    signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
 
-This file is intentionally "boring + reliable":
-- No signing of path/query/body
-- Supports pagination via max/offset
-- Supports repeated query params if you pass params as a list of tuples
+Why this file exists:
+- Your Railway deploys have crashed due to missing deps / import mismatches.
+- This file avoids external deps and provides backward-compatible exports:
+    - FourOverClient
+    - client (singleton, safe)
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
+import socket
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-from urllib.parse import urlencode
-
-import requests
+from urllib.parse import urlencode, urljoin
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 
 QueryParams = Union[
     Dict[str, Any],
-    Sequence[Tuple[str, Any]],  # allows repeated keys like ("options[]", "uuid1"), ("options[]", "uuid2")
+    Sequence[Tuple[str, Any]],  # allows repeated keys: [("options[]","a"), ("options[]","b")]
 ]
 
 
 class FourOverAuthError(RuntimeError):
+    """Raised for 401 Unauthorized responses from 4over."""
     pass
 
 
 class FourOverRequestError(RuntimeError):
+    """Raised for request failures or non-2xx responses from 4over."""
     pass
 
 
 def _normalize_private_key(raw: str) -> str:
     """
     Normalize private key from env vars:
-    - Convert literal '\\n' into newlines (for PEM-style secrets stored in single-line env vars)
+    - Convert literal '\\n' into real newlines (for PEM stored in single-line env vars)
     - Strip whitespace
     """
     if raw is None:
@@ -53,15 +59,19 @@ def _normalize_private_key(raw: str) -> str:
 def _signature_for_method(http_method: str, private_key: str) -> str:
     """
     4over doc-style signature:
-    signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
+      signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
 
-    NOTE: the HMAC key is the hex digest of sha256(private_key), encoded as UTF-8 bytes,
-    matching the style shown in many docs/examples.
+    IMPORTANT DETAIL:
+    Many doc examples do:
+      key = sha256(private_key).hexdigest()
+      signature = hmac_sha256(key, method)
+
+    We'll match that: HMAC key is sha256(private_key).hexdigest() as UTF-8 bytes.
     """
-    m = (http_method or "").upper().encode("utf-8")
+    method = (http_method or "").upper().encode("utf-8")
     pk = _normalize_private_key(private_key)
     key = hashlib.sha256(pk.encode("utf-8")).hexdigest().encode("utf-8")
-    return hmac.new(key, m, hashlib.sha256).hexdigest()
+    return hmac.new(key, method, hashlib.sha256).hexdigest()
 
 
 def _merge_params(base: Optional[QueryParams], extra: Optional[QueryParams]) -> QueryParams:
@@ -83,18 +93,26 @@ def _merge_params(base: Optional[QueryParams], extra: Optional[QueryParams]) -> 
             else:
                 out.extend(list(extra.items()))
         return out
-    # both dicts
     merged = dict(base or {})
     merged.update(dict(extra or {}))
     return merged
 
 
-def _params_to_querystring(params: Optional[QueryParams]) -> str:
+def _params_to_query(params: Optional[QueryParams]) -> str:
     if not params:
         return ""
     if isinstance(params, (list, tuple)):
         return urlencode([(k, "" if v is None else str(v)) for k, v in params], doseq=True)
     return urlencode({k: "" if v is None else str(v) for k, v in params.items()}, doseq=True)
+
+
+def _json_loads_safe(text: str) -> Any:
+    if not text or not text.strip():
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"raw": text[:5000]}
 
 
 @dataclass
@@ -108,18 +126,18 @@ class FourOverClientConfig:
 
 class FourOverClient:
     def __init__(self, config: FourOverClientConfig):
-        self.base_url = (config.base_url or "").rstrip("/")
+        self.base_url = (config.base_url or "").rstrip("/") + "/"
         self.apikey = (config.apikey or "").strip()
         self.private_key = config.private_key or ""
-        self.timeout = config.timeout
-        self.user_agent = config.user_agent
+        self.timeout = int(config.timeout or 30)
+        self.user_agent = config.user_agent or "catdi-4over-connector/1.0"
 
-        if not self.base_url:
-            raise ValueError("FourOverClient base_url is required")
+        if not self.base_url.strip("/"):
+            raise ValueError("FOUR_OVER_BASE_URL is required")
         if not self.apikey:
-            raise ValueError("FourOverClient apikey is required")
+            raise ValueError("FOUR_OVER_APIKEY is required")
         if not self.private_key:
-            raise ValueError("FourOverClient private_key is required")
+            raise ValueError("FOUR_OVER_PRIVATE_KEY is required")
 
     @classmethod
     def from_env(cls) -> "FourOverClient":
@@ -145,87 +163,126 @@ class FourOverClient:
         path: str,
         params: Optional[QueryParams] = None,
         json_body: Any = None,
-    ) -> requests.Response:
-        method = (method or "").upper()
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Returns a dict:
+          {
+            "status": int,
+            "url": str,
+            "headers": dict,
+            "text": str,
+            "json": parsed_json_or_none,
+          }
+        """
+        method = (method or "GET").upper()
         if not path.startswith("/"):
             path = "/" + path
 
-        url = f"{self.base_url}{path}"
+        # Build URL
+        url = urljoin(self.base_url, path.lstrip("/"))
 
+        # Build signature (method-based)
         sig = _signature_for_method(method, self.private_key)
 
-        headers = {
+        # Auth placement
+        req_headers = {
             "Accept": "application/json",
             "User-Agent": self.user_agent,
         }
+        if headers:
+            req_headers.update(headers)
 
-        # Auth placement per docs
+        final_params: Optional[QueryParams] = params
+
         if method in ("GET", "DELETE"):
             auth_params: QueryParams = {"apikey": self.apikey, "signature": sig}
-            merged = _merge_params(params, auth_params)
-            final_params = merged
+            final_params = _merge_params(params, auth_params)
         else:
-            headers["Authorization"] = f"API {self.apikey}:{sig}"
-            final_params = params
+            # POST/PUT/PATCH: auth in header
+            req_headers["Authorization"] = f"API {self.apikey}:{sig}"
+
+        qs = _params_to_query(final_params)
+        if qs:
+            full_url = f"{url}?{qs}"
+        else:
+            full_url = url
+
+        data_bytes: Optional[bytes] = None
+        if json_body is not None:
+            data_bytes = json.dumps(json_body).encode("utf-8")
+            req_headers["Content-Type"] = "application/json"
+
+        req = Request(full_url, data=data_bytes, headers=req_headers, method=method)
 
         try:
-            resp = requests.request(
-                method,
-                url,
-                params=final_params if final_params else None,
-                json=json_body,
-                headers=headers,
-                timeout=self.timeout,
-            )
-        except requests.RequestException as e:
-            raise FourOverRequestError(f"Request failed: {method} {url} -> {e}") from e
+            with urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                text = raw.decode("utf-8", errors="replace")
+                status = getattr(resp, "status", 200)
+                out_headers = dict(resp.headers.items())
+                return {
+                    "status": status,
+                    "url": full_url,
+                    "headers": out_headers,
+                    "text": text,
+                    "json": _json_loads_safe(text),
+                }
 
-        # Raise for auth specifically
-        if resp.status_code == 401:
-            raise FourOverAuthError(
-                f"4over Authentication Failed (401) for {method} {url} "
-                f"params={_params_to_querystring(final_params)}"
+        except HTTPError as e:
+            raw = e.read() if hasattr(e, "read") else b""
+            text = raw.decode("utf-8", errors="replace") if raw else (str(e) or "")
+            status = getattr(e, "code", 0) or 0
+            body = _json_loads_safe(text)
+
+            if status == 401:
+                raise FourOverAuthError(
+                    json.dumps(
+                        {
+                            "error": "4over_auth_failed",
+                            "status": status,
+                            "url": full_url,
+                            "body": body,
+                        }
+                    )
+                )
+
+            raise FourOverRequestError(
+                json.dumps(
+                    {
+                        "error": "4over_request_failed",
+                        "status": status,
+                        "url": full_url,
+                        "body": body,
+                    }
+                )
             )
 
-        return resp
+        except (URLError, socket.timeout) as e:
+            raise FourOverRequestError(
+                json.dumps(
+                    {
+                        "error": "4over_transport_failed",
+                        "url": full_url,
+                        "message": str(e),
+                    }
+                )
+            )
 
     # -------------------------
-    # Helpers that return JSON
+    # Convenience JSON helpers
     # -------------------------
     def get_json(self, path: str, params: Optional[QueryParams] = None) -> Any:
-        resp = self.request("GET", path, params=params)
-        return self._parse_json_or_raise(resp)
+        r = self.request("GET", path, params=params)
+        return r["json"]
 
     def post_json(self, path: str, json_body: Any = None, params: Optional[QueryParams] = None) -> Any:
-        resp = self.request("POST", path, params=params, json_body=json_body)
-        return self._parse_json_or_raise(resp)
+        r = self.request("POST", path, params=params, json_body=json_body)
+        return r["json"]
 
     def delete_json(self, path: str, params: Optional[QueryParams] = None) -> Any:
-        resp = self.request("DELETE", path, params=params)
-        return self._parse_json_or_raise(resp)
-
-    def _parse_json_or_raise(self, resp: requests.Response) -> Any:
-        """
-        Normalize errors into useful exceptions. 4over often returns JSON error bodies.
-        """
-        text = resp.text or ""
-        if resp.status_code >= 400:
-            # attempt to parse body for message
-            try:
-                body = resp.json()
-            except Exception:
-                body = {"raw": text[:2000]}
-            raise FourOverRequestError(
-                f"4over_request_failed status={resp.status_code} url={resp.url} body={body}"
-            )
-
-        if not text.strip():
-            return None
-
-        try:
-            return resp.json()
-        except Exception as e:
-            raise FourOverRequestError(f"Expected JSON but got non-JSON from {resp.url}: {text[:2000]}") from e
+        r = self.request("DELETE", path, params=params)
+        return r["json"]
 
     # -------------------------
     # Pagination helper (max/offset)
@@ -241,12 +298,10 @@ class FourOverClient:
         entities_key: str = "entities",
     ) -> List[Any]:
         """
-        Many 4over endpoints return { "entities": [...], ... } and default to 20 items.
-        This helper pages using max/offset until the returned entity count < max.
-
-        - entities_key defaults to "entities" but can be changed if needed.
+        Pages through 4over endpoints using max/offset.
+        Assumes response is a dict containing entities_key (default "entities") list.
         """
-        all_entities: List[Any] = []
+        all_items: List[Any] = []
         offset = start_offset
         pages = 0
         base_params = dict(base_params or {})
@@ -254,36 +309,40 @@ class FourOverClient:
         while True:
             pages += 1
             if pages > max_pages:
-                raise FourOverRequestError(f"Pagination exceeded max_pages={max_pages} for {path}")
+                raise FourOverRequestError(
+                    f"Pagination exceeded max_pages={max_pages} for {path}"
+                )
 
             params = dict(base_params)
             params["max"] = max_per_page
             params["offset"] = offset
 
             data = self.get_json(path, params=params)
-            entities = data.get(entities_key, []) if isinstance(data, dict) else []
+            if not isinstance(data, dict):
+                raise FourOverRequestError(f"Unexpected payload type for {path}: {type(data)}")
 
+            entities = data.get(entities_key, [])
             if not isinstance(entities, list):
                 raise FourOverRequestError(
-                    f"Unexpected pagination payload for {path}: expected list at key '{entities_key}'"
+                    f"Unexpected pagination key '{entities_key}' for {path}"
                 )
 
-            all_entities.extend(entities)
+            all_items.extend(entities)
 
-            # stop condition
             if len(entities) < max_per_page:
                 break
 
             offset += max_per_page
 
-        return all_entities
+        return all_items
 
     # -------------------------
     # Debug helpers (safe)
     # -------------------------
     def debug_signatures(self) -> Dict[str, str]:
         """
-        Returns the signatures this client will generate per method (no secrets exposed).
+        Return signatures per method (no secrets).
+        Useful for /debug/sign endpoints.
         """
         return {
             "GET": _signature_for_method("GET", self.private_key),
@@ -292,9 +351,13 @@ class FourOverClient:
             "PATCH": _signature_for_method("PATCH", self.private_key),
             "DELETE": _signature_for_method("DELETE", self.private_key),
         }
-# Backwards-compatible singleton (older routers import `client`)
+
+
+# -------------------------------------------------------------------
+# Backwards-compatible export: some older routers import `client`
+# -------------------------------------------------------------------
 try:
     client = FourOverClient.from_env()
 except Exception:
-    # Avoid crashing at import time; routes can instantiate later if needed
+    # Do not crash at import time (Railway 502). Routes can instantiate later.
     client = None

@@ -1,96 +1,58 @@
+# fourover_client.py
 import os
-import time
 import hmac
 import hashlib
-import requests
-from dataclasses import dataclass
 from urllib.parse import urlencode
-
+import requests
 
 class FourOverError(Exception):
-    def __init__(self, status: int, url: str, body: str = "", canonical: str = ""):
-        super().__init__(f"4over request failed status={status} url={url}")
+    def __init__(self, status: int, url: str, body: str, canonical: str):
+        super().__init__(f"4over error {status}")
         self.status = status
         self.url = url
         self.body = body
         self.canonical = canonical
 
-
-def _env(name: str) -> str:
+def _env_required(name: str) -> str:
     v = os.getenv(name)
+    if v is None:
+        raise RuntimeError(f"Missing required env var: {name}")
+    v = v.strip()
     if not v:
-        raise RuntimeError(f"Missing env var: {name}")
+        raise RuntimeError(f"Empty required env var: {name}")
     return v
 
-
 def _base_url() -> str:
-    return os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
+    return os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").strip() or "https://api.4over.com"
 
-
-def _apikey() -> str:
-    return _env("FOUR_OVER_APIKEY")
-
-
-def _private_key() -> str:
-    return _env("FOUR_OVER_PRIVATE_KEY")
-
-
-def _signature_for_canonical(canonical: str) -> str:
-    # 4over expects HMAC-SHA256 over canonical path+query
-    key = _private_key().encode("utf-8")
-    msg = canonical.encode("utf-8")
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()
-
-
-def _signed_url(path: str, params: dict | None = None) -> tuple[str, str]:
-    """
-    Returns (url, canonical) where canonical is '/path?apikey=...&x=y'
-    """
-    params = dict(params or {})
-    params["apikey"] = _apikey()
-
-    # stable ordering of query params
-    query = urlencode(sorted(params.items()), doseq=True)
+def _sign(path: str, apikey: str, private_key: str, extra_params: dict | None = None) -> tuple[str, str]:
+    params = {"apikey": apikey}
+    if extra_params:
+        for k in sorted(extra_params.keys()):
+            params[k] = extra_params[k]
+    query = urlencode(params)
     canonical = f"{path}?{query}"
+    sig = hmac.new(private_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+    return canonical, sig
 
-    sig = _signature_for_canonical(canonical)
-    url = f"{_base_url()}{canonical}&signature={sig}"
-    return url, canonical
+def _get_json(path: str, extra_params: dict | None = None) -> dict:
+    apikey = _env_required("FOUR_OVER_APIKEY")
+    private_key = _env_required("FOUR_OVER_PRIVATE_KEY")
+    base = _base_url()
 
+    canonical, sig = _sign(path, apikey, private_key, extra_params=extra_params)
+    url = f"{base}{canonical}&signature={sig}"
 
-@dataclass
-class FourOverClient:
-    timeout: int = 30
-
-    def get(self, path: str, params: dict | None = None) -> dict:
-        url, canonical = _signed_url(path, params=params)
-        try:
-            r = requests.get(url, timeout=self.timeout)
-        except Exception as e:
-            raise FourOverError(status=502, url=url, body=str(e), canonical=canonical)
-
-        if r.status_code >= 400:
-            raise FourOverError(status=r.status_code, url=url, body=r.text, canonical=canonical)
-
-        try:
-            return r.json()
-        except Exception:
-            raise FourOverError(status=502, url=url, body=r.text, canonical=canonical)
-
-
-# ✅ This is what your router expects:
-client = FourOverClient(timeout=30)
-
-
-# ---- Friendly wrappers your main.py already uses ----
+    r = requests.get(url, timeout=30)
+    if r.status_code >= 400:
+        raise FourOverError(r.status_code, url, r.text, canonical)
+    return r.json()
 
 def whoami() -> dict:
-    return client.get("/whoami")
-
+    return _get_json("/whoami")
 
 def product_baseprices(product_uuid: str) -> dict:
-    return client.get(f"/printproducts/products/{product_uuid}/baseprices")
-
+    return _get_json(f"/printproducts/products/{product_uuid}/baseprices")
 
 def product_optiongroups(product_uuid: str) -> dict:
-    return client.get(f"/printproducts/products/{product_uuid}/optiongroups")
+    return _get_json(f"/printproducts/products/{product_uuid}/optiongroups")

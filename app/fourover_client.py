@@ -1,18 +1,18 @@
 """
-fourover_client.py
+Backwards-compatible FourOverClient.
 
-Backwards-compatible FourOverClient supporting:
-- FourOverClient()
-- FourOverClient(config=FourOverConfig(...))
+Supports BOTH styles:
 - FourOverClient(base_url=..., apikey=..., private_key=..., timeout_seconds=...)
-- Legacy args supported:
-    public_key (alias of apikey)
-    timeout (alias of timeout_seconds)
+- Legacy aliases:
+    public_key -> apikey
+    timeout -> timeout_seconds
 
-4over Authentication per docs (as implemented here):
-- GET/DELETE: apikey + signature in query
-- POST/PUT/PATCH: Authorization header "API {apikey}:{signature}"
-- signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key).hexdigest())
+Implements:
+- GET / DELETE: apikey + signature in query params
+- POST / PUT / PATCH: Authorization header "API {apikey}:{signature}"
+
+Signature implementation here matches your previous v2 approach:
+    signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key).hexdigest())
 """
 
 from __future__ import annotations
@@ -64,26 +64,6 @@ class FourOverConfig:
             timeout_seconds=timeout_seconds,
         )
 
-    @staticmethod
-    def from_values(
-        *,
-        base_url: Optional[str] = None,
-        apikey: Optional[str] = None,
-        private_key: Optional[str] = None,
-        timeout_seconds: Optional[int] = None,
-    ) -> "FourOverConfig":
-        b = (base_url or os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").strip().rstrip("/")
-        k = (apikey or os.getenv("FOUR_OVER_APIKEY") or "").strip()
-        pk = (private_key or os.getenv("FOUR_OVER_PRIVATE_KEY") or "").strip()
-        t = int(timeout_seconds or os.getenv("FOUR_OVER_TIMEOUT", "30"))
-
-        if not k:
-            raise FourOverError("Missing apikey / FOUR_OVER_APIKEY")
-        if not pk:
-            raise FourOverError("Missing private_key / FOUR_OVER_PRIVATE_KEY")
-
-        return FourOverConfig(base_url=b, public_key=k, private_key=pk, timeout_seconds=t)
-
 
 class FourOverClient:
     def __init__(
@@ -92,10 +72,10 @@ class FourOverClient:
         *,
         base_url: Optional[str] = None,
         apikey: Optional[str] = None,
-        public_key: Optional[str] = None,        # legacy alias
+        public_key: Optional[str] = None,  # legacy alias
         private_key: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
-        timeout: Optional[int] = None,           # legacy alias
+        timeout: Optional[int] = None,  # legacy alias
     ):
         # normalize legacy aliases
         if apikey is None and public_key is not None:
@@ -105,37 +85,31 @@ class FourOverClient:
 
         if config is None:
             if base_url is not None or apikey is not None or private_key is not None or timeout_seconds is not None:
-                config = FourOverConfig.from_values(
-                    base_url=base_url,
-                    apikey=apikey,
-                    private_key=private_key,
-                    timeout_seconds=timeout_seconds,
-                )
+                # build config from explicit values (fallback to env)
+                b = (base_url or os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").strip().rstrip("/")
+                k = (apikey or os.getenv("FOUR_OVER_APIKEY") or "").strip()
+                pk = (private_key or os.getenv("FOUR_OVER_PRIVATE_KEY") or "").strip()
+                t = int(timeout_seconds or os.getenv("FOUR_OVER_TIMEOUT", "30"))
+
+                if not k:
+                    raise FourOverError("Missing apikey / FOUR_OVER_APIKEY")
+                if not pk:
+                    raise FourOverError("Missing private_key / FOUR_OVER_PRIVATE_KEY")
+
+                config = FourOverConfig(base_url=b, public_key=k, private_key=pk, timeout_seconds=t)
             else:
                 config = FourOverConfig.from_env()
 
         self.config = config
         self.session = requests.Session()
 
-        # docs-style: HMAC key = sha256(private_key) hex digest (string)
+        # docs-style used in your earlier v2: HMAC key = sha256(private_key).hexdigest() (string)
         self._hashed_private_hex = hashlib.sha256(self.config.private_key.encode("utf-8")).hexdigest()
 
     def _signature_for_method(self, method: str) -> str:
         msg = method.upper().encode("utf-8")
         key = self._hashed_private_hex.encode("utf-8")
         return hmac.new(key, msg, hashlib.sha256).hexdigest()
-
-    def _auth_params_for_get_delete(self, method: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        p = dict(params or {})
-        p["apikey"] = self.config.public_key
-        p["signature"] = self._signature_for_method(method)
-        return p
-
-    def _auth_headers_for_write(self, method: str, headers: Optional[Dict[str, str]]) -> Dict[str, str]:
-        h = dict(headers or {})
-        sig = self._signature_for_method(method)
-        h["Authorization"] = f"API {self.config.public_key}:{sig}"
-        return h
 
     def request(
         self,
@@ -153,12 +127,15 @@ class FourOverClient:
 
         url = f"{self.config.base_url}{path}"
 
+        req_params = dict(params or {})
+        req_headers = dict(headers or {})
+
         if method_u in ("GET", "DELETE"):
-            req_params = self._auth_params_for_get_delete(method_u, params)
-            req_headers = dict(headers or {})
+            req_params["apikey"] = self.config.public_key
+            req_params["signature"] = self._signature_for_method(method_u)
         elif method_u in ("POST", "PUT", "PATCH"):
-            req_params = dict(params or {})
-            req_headers = self._auth_headers_for_write(method_u, headers)
+            sig = self._signature_for_method(method_u)
+            req_headers["Authorization"] = f"API {self.config.public_key}:{sig}"
         else:
             raise FourOverError(f"Unsupported HTTP method: {method_u}")
 
@@ -199,7 +176,7 @@ class FourOverClient:
 
         return parsed if parsed is not None else body_text
 
-    # Convenience helpers (what your main.py expects)
+    # Convenience helpers (so your app can do c.get("/whoami"))
     def get(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
         return self.request("GET", path, params=params)
 

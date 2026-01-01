@@ -1,152 +1,149 @@
-# db.py
 import os
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-# Railway Postgres URLs sometimes start with postgres:// which SQLAlchemy wants as postgresql://
+# Railway sometimes provides postgres:// (SQLAlchemy expects postgresql://)
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-connect_args = {}
-if DATABASE_URL.startswith("sqlite"):
-    connect_args = {"check_same_thread": False}
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    pool_pre_ping=True,
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
 
-def ensure_schema() -> List[str]:
+class BasePriceCache(Base):
+    __tablename__ = "baseprice_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    product_uuid = Column(String(64), nullable=False)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    payload_json = Column(Text, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("product_uuid", name="uq_baseprice_cache_product_uuid"),
+    )
+
+
+def ensure_schema():
     """
-    Idempotent schema setup.
-    Creates baseprice_cache if missing, and ensures product_uuid unique.
-    Uses columns: id, product_uuid, payload (json/jsonb), created_at.
+    Safe, idempotent schema creation + minimal migrations.
+    Prevents your 'fetched_at does not exist' crash.
     """
-    created = []
+    Base.metadata.create_all(bind=engine)
+
+    # Minimal migration for older tables missing columns
     with engine.begin() as conn:
+        # Check columns
+        cols = set()
         if DATABASE_URL.startswith("sqlite"):
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS baseprice_cache (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    product_uuid TEXT NOT NULL UNIQUE,
-                    payload TEXT NOT NULL,
-                    created_at TEXT DEFAULT (datetime('now'))
-                );
-            """))
-            created.append("baseprice_cache")
+            rows = conn.execute(text("PRAGMA table_info(baseprice_cache)")).fetchall()
+            cols = {r[1] for r in rows}
         else:
-            # Postgres
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS baseprice_cache (
-                    id BIGSERIAL PRIMARY KEY,
-                    product_uuid VARCHAR NOT NULL UNIQUE,
-                    payload JSONB NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-            """))
-            # extra safety: ensure unique constraint exists
-            conn.execute(text("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1
-                        FROM pg_indexes
-                        WHERE schemaname = 'public'
-                          AND indexname = 'ix_baseprice_cache_product_uuid'
-                    ) THEN
-                        CREATE UNIQUE INDEX ix_baseprice_cache_product_uuid
-                        ON baseprice_cache (product_uuid);
-                    END IF;
-                END$$;
-            """))
-            created.append("baseprice_cache")
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name='baseprice_cache'
+                    """
+                )
+            ).fetchall()
+            cols = {r[0] for r in rows}
 
-    return created
+        if "fetched_at" not in cols:
+            conn.execute(text("ALTER TABLE baseprice_cache ADD COLUMN fetched_at TIMESTAMPTZ"))
+            conn.execute(text("UPDATE baseprice_cache SET fetched_at = NOW() WHERE fetched_at IS NULL"))
+
+        if "payload_json" not in cols:
+            conn.execute(text("ALTER TABLE baseprice_cache ADD COLUMN payload_json TEXT"))
+            conn.execute(text("UPDATE baseprice_cache SET payload_json = '{}' WHERE payload_json IS NULL"))
 
 
-def insert_baseprice_cache(product_uuid: str, payload: Dict[str, Any]) -> int:
+def upsert_baseprice_cache(product_uuid: str, payload_json: str) -> int:
     """
-    Upsert cache row for product_uuid.
+    One row per product_uuid. Replaces duplicates with updates.
+    Works on Postgres + SQLite.
     Returns the row id.
     """
-    if not product_uuid:
-        raise ValueError("product_uuid is required")
+    ensure_schema()
 
-    with engine.begin() as conn:
-        if DATABASE_URL.startswith("sqlite"):
-            # store JSON as string in sqlite
-            import json
-            payload_str = json.dumps(payload)
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    try:
+        existing = db.query(BasePriceCache).filter(BasePriceCache.product_uuid == product_uuid).first()
+        if existing:
+            existing.payload_json = payload_json
+            existing.fetched_at = now
+            db.commit()
+            db.refresh(existing)
+            return existing.id
 
-            conn.execute(text("""
-                INSERT INTO baseprice_cache (product_uuid, payload)
-                VALUES (:product_uuid, :payload)
-                ON CONFLICT(product_uuid) DO UPDATE SET
-                    payload=excluded.payload
-            """), {"product_uuid": product_uuid, "payload": payload_str})
-
-            row = conn.execute(
-                text("SELECT id FROM baseprice_cache WHERE product_uuid = :product_uuid"),
-                {"product_uuid": product_uuid},
-            ).fetchone()
-            return int(row[0])
-
-        # Postgres JSONB
-        row = conn.execute(text("""
-            INSERT INTO baseprice_cache (product_uuid, payload)
-            VALUES (:product_uuid, :payload::jsonb)
-            ON CONFLICT (product_uuid) DO UPDATE SET
-                payload = EXCLUDED.payload,
-                created_at = NOW()
-            RETURNING id;
-        """), {"product_uuid": product_uuid, "payload": payload}).fetchone()
-
-        return int(row[0])
+        row = BasePriceCache(product_uuid=product_uuid, payload_json=payload_json, fetched_at=now)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+    finally:
+        db.close()
 
 
-def list_baseprice_cache(limit: int = 25) -> List[Dict[str, Any]]:
-    limit = max(1, min(int(limit), 200))
+def list_baseprice_cache(limit: int = 25):
+    ensure_schema()
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(BasePriceCache)
+            .order_by(BasePriceCache.fetched_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "product_uuid": r.product_uuid,
+                "created_at": r.fetched_at.isoformat(),
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
 
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT id, product_uuid, payload, created_at
-            FROM baseprice_cache
-            ORDER BY created_at DESC
-            LIMIT :limit
-        """), {"limit": limit}).mappings().all()
 
-        # If sqlite payload stored as string, decode it
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            item = dict(r)
-            if DATABASE_URL.startswith("sqlite"):
-                import json
-                item["payload"] = json.loads(item["payload"])
-            out.append(item)
-        return out
-
-
-def latest_baseprice_cache(product_uuid: str) -> Optional[Dict[str, Any]]:
-    if not product_uuid:
-        return None
-
-    with engine.begin() as conn:
-        row = conn.execute(text("""
-            SELECT id, product_uuid, payload, created_at
-            FROM baseprice_cache
-            WHERE product_uuid = :product_uuid
-            ORDER BY created_at DESC
-            LIMIT 1
-        """), {"product_uuid": product_uuid}).mappings().fetchone()
-
-        if not row:
+def latest_baseprice_cache(product_uuid: str):
+    ensure_schema()
+    db = SessionLocal()
+    try:
+        r = (
+            db.query(BasePriceCache)
+            .filter(BasePriceCache.product_uuid == product_uuid)
+            .order_by(BasePriceCache.fetched_at.desc())
+            .first()
+        )
+        if not r:
             return None
-
-        item = dict(row)
-        if DATABASE_URL.startswith("sqlite"):
-            import json
-            item["payload"] = json.loads(item["payload"])
-        return item
+        return {
+            "id": r.id,
+            "product_uuid": r.product_uuid,
+            "created_at": r.fetched_at.isoformat(),
+            "payload_json": r.payload_json,
+        }
+    finally:
+        db.close()

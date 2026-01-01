@@ -1,16 +1,18 @@
 """
-fourover_client.py (ROOT FOLDER)
+fourover_client.py
 
-Backwards-compatible FourOverClient that supports:
+Backwards-compatible FourOverClient supporting:
+- FourOverClient()
+- FourOverClient(config=FourOverConfig(...))
+- FourOverClient(base_url=..., apikey=..., private_key=..., timeout_seconds=...)
+- Legacy args supported:
+    public_key (alias of apikey)
+    timeout (alias of timeout_seconds)
 
-  FourOverClient()
-  FourOverClient(config=FourOverConfig(...))
-  FourOverClient(base_url=..., apikey=..., private_key=..., timeout_seconds=...)
-
-4over Authentication per docs:
+4over Authentication per docs (as implemented here):
 - GET/DELETE: apikey + signature in query
 - POST/PUT/PATCH: Authorization header "API {apikey}:{signature}"
-- signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
+- signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key).hexdigest())
 """
 
 from __future__ import annotations
@@ -24,25 +26,17 @@ from typing import Any, Dict, Optional, Union
 import requests
 
 
-# -------------------------
-# Errors
-# -------------------------
-
 class FourOverError(Exception):
-    """Base error for all 4over client exceptions."""
+    pass
 
 
 class FourOverAuthError(FourOverError):
-    """Authentication/authorization failure (401/403)."""
+    pass
 
 
 class FourOverHTTPError(FourOverError):
-    """Non-auth HTTP error from 4over or network issues."""
+    pass
 
-
-# -------------------------
-# Config
-# -------------------------
 
 @dataclass(frozen=True)
 class FourOverConfig:
@@ -53,22 +47,21 @@ class FourOverConfig:
 
     @staticmethod
     def from_env() -> "FourOverConfig":
-        base_url = (os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").strip()
+        base_url = (os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").strip().rstrip("/")
         public_key = (os.getenv("FOUR_OVER_APIKEY") or "").strip()
         private_key = (os.getenv("FOUR_OVER_PRIVATE_KEY") or "").strip()
+        timeout_seconds = int(os.getenv("FOUR_OVER_TIMEOUT", "30"))
 
         if not public_key:
             raise FourOverError("Missing env var FOUR_OVER_APIKEY")
         if not private_key:
             raise FourOverError("Missing env var FOUR_OVER_PRIVATE_KEY")
 
-        base_url = base_url.rstrip("/")
-
         return FourOverConfig(
             base_url=base_url,
             public_key=public_key,
             private_key=private_key,
-            timeout_seconds=int(os.getenv("FOUR_OVER_TIMEOUT", "30")),
+            timeout_seconds=timeout_seconds,
         )
 
     @staticmethod
@@ -92,31 +85,24 @@ class FourOverConfig:
         return FourOverConfig(base_url=b, public_key=k, private_key=pk, timeout_seconds=t)
 
 
-# -------------------------
-# Client
-# -------------------------
-
 class FourOverClient:
-    """
-    Backward compatible constructor.
-
-    Old style (your current main.py likely does this):
-      FourOverClient(base_url=..., apikey=..., private_key=...)
-
-    New style:
-      FourOverClient(config=FourOverConfig(...)) or FourOverClient()
-    """
-
     def __init__(
         self,
         config: Optional[FourOverConfig] = None,
         *,
         base_url: Optional[str] = None,
         apikey: Optional[str] = None,
+        public_key: Optional[str] = None,        # legacy alias
         private_key: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
+        timeout: Optional[int] = None,           # legacy alias
     ):
-        # If caller passes base_url/apikey/private_key, build config from those.
+        # normalize legacy aliases
+        if apikey is None and public_key is not None:
+            apikey = public_key
+        if timeout_seconds is None and timeout is not None:
+            timeout_seconds = timeout
+
         if config is None:
             if base_url is not None or apikey is not None or private_key is not None or timeout_seconds is not None:
                 config = FourOverConfig.from_values(
@@ -131,13 +117,10 @@ class FourOverClient:
         self.config = config
         self.session = requests.Session()
 
-        # docs: HMAC key = sha256(private_key) (hex string)
+        # docs-style: HMAC key = sha256(private_key) hex digest (string)
         self._hashed_private_hex = hashlib.sha256(self.config.private_key.encode("utf-8")).hexdigest()
 
     def _signature_for_method(self, method: str) -> str:
-        """
-        signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
-        """
         msg = method.upper().encode("utf-8")
         key = self._hashed_private_hex.encode("utf-8")
         return hmac.new(key, msg, hashlib.sha256).hexdigest()
@@ -216,18 +199,12 @@ class FourOverClient:
 
         return parsed if parsed is not None else body_text
 
-    # Convenience
+    # Convenience helpers (what your main.py expects)
+    def get(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
+        return self.request("GET", path, params=params)
+
+    def post(self, path: str, *, params: Optional[Dict[str, Any]] = None, json: Optional[Any] = None) -> Any:
+        return self.request("POST", path, params=params, json=json)
+
     def whoami(self) -> Any:
-        return self.request("GET", "/whoami")
-
-
-def _debug_signature() -> Dict[str, str]:
-    cfg = FourOverConfig.from_env()
-    client = FourOverClient(cfg)
-    return {
-        "base_url": cfg.base_url,
-        "public_key_present": str(bool(cfg.public_key)).lower(),
-        "private_key_len": str(len(cfg.private_key)),
-        "sig_get": client._signature_for_method("GET"),
-        "sig_post": client._signature_for_method("POST"),
-    }
+        return self.get("/whoami")

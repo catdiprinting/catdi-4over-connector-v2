@@ -1,217 +1,152 @@
 # fourover_client.py
-from __future__ import annotations
-
-import hashlib
-import hmac
 import os
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlencode
+import json
+import hmac
+import hashlib
+from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
 
 
-# -------------------------
-# Errors
-# -------------------------
-
 class FourOverError(Exception):
     """Base error for 4over client."""
-    pass
 
 
 class FourOverAuthError(FourOverError):
-    """Raised when authentication fails (401/403)."""
-    pass
+    """Raised when 4over returns 401/403 or auth fails."""
 
 
-class FourOverHTTPError(FourOverError):
-    """Raised for non-auth HTTP errors."""
-    def __init__(self, status_code: int, message: str, url: str, body: str = ""):
-        super().__init__(f"{status_code} {message} url={url} body={body[:500]}")
-        self.status_code = status_code
-        self.url = url
-        self.body = body
+class FourOverAPIError(FourOverError):
+    """Raised for non-auth API errors."""
 
 
-# -------------------------
-# Client
-# -------------------------
-
-@dataclass
 class FourOverClient:
-    base_url: str
-    public_key: str
-    private_key: str
-    timeout: int = 30
-    user_agent: str = "catdi-4over-connector/1.0"
+    """
+    4over API client implementing API Key Authentication per 4over docs.
 
-    def __post_init__(self) -> None:
-        self.base_url = (self.base_url or "").rstrip("/")
-        if not self.base_url:
-            raise ValueError("base_url is required")
+    Key point:
+    - Signature is HMAC-SHA256 of the HTTP_METHOD (e.g., "GET", "POST")
+      using sha256(private_key) as the HMAC key.
+    - For GET/DELETE: pass apikey + signature in query string.
+    - For POST/PUT/PATCH: pass Authorization header: "API {PUBLIC_KEY}:{SIGNATURE}"
+
+    Docs: https://api-users.4over.com/?page_id=44
+    """
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        public_key: Optional[str] = None,
+        private_key: Optional[str] = None,
+        timeout: int = 30,
+    ) -> None:
+        self.base_url = (base_url or os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com")).rstrip("/")
+        self.public_key = public_key or os.getenv("FOUR_OVER_APIKEY", "")
+        self.private_key = private_key or os.getenv("FOUR_OVER_PRIVATE_KEY", "")
+        self.timeout = timeout
+
         if not self.public_key:
-            raise ValueError("public_key is required")
+            raise FourOverAuthError("Missing FOUR_OVER_APIKEY (public key).")
         if not self.private_key:
-            raise ValueError("private_key is required")
+            raise FourOverAuthError("Missing FOUR_OVER_PRIVATE_KEY (private key).")
 
-        # IMPORTANT:
-        # 4over "API Key Authentication" signature for GET/DELETE is:
-        # signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key))
-        # NOTE: signature does NOT include path or query string. :contentReference[oaicite:1]{index=1}
-        self._derived_key_hex = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
+        # Per docs: private_key = sha256(private_key).hexdigest()
+        # Use that hex string (as bytes) as the HMAC key
+        hashed = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
+        self._hmac_key = hashed.encode("utf-8")
 
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": self.user_agent})
 
-    # ---------- auth helpers ----------
+    def _signature_for_method(self, method: str) -> str:
+        m = method.upper().encode("utf-8")
+        return hmac.new(self._hmac_key, m, hashlib.sha256).hexdigest()
 
-    def signature_for_method(self, method: str) -> str:
-        method_up = method.upper().strip()
-        return hmac.new(
-            self._derived_key_hex.encode("utf-8"),
-            method_up.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-    def build_get_delete_url(self, path: str, params: Optional[Dict[str, Any]] = None) -> str:
+    def _url(self, path: str) -> str:
         if not path.startswith("/"):
             path = "/" + path
+        return f"{self.base_url}{path}"
 
-        q: Dict[str, Any] = {}
-        if params:
-            q.update(params)
-
-        # add auth params
-        q["apikey"] = self.public_key
-        q["signature"] = self.signature_for_method("GET")  # GET/DELETE use query auth signature
-
-        # keep it stable
-        qs = urlencode(q, doseq=True)
-        return f"{self.base_url}{path}?{qs}"
-
-    def build_headers_for_write(self, method: str) -> Dict[str, str]:
-        # POST/PUT/PATCH: use Authorization header per docs. :contentReference[oaicite:2]{index=2}
-        sig = self.signature_for_method(method)
-        return {"Authorization": f"API {self.public_key}:{sig}"}
-
-    # ---------- request core ----------
+    def _parse_json(self, resp: requests.Response) -> Union[Dict[str, Any], Any, str]:
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "application/json" in ctype:
+            try:
+                return resp.json()
+            except Exception:
+                return resp.text
+        # 4over sometimes returns JSON as text; try anyway
+        try:
+            return json.loads(resp.text)
+        except Exception:
+            return resp.text
 
     def request(
         self,
         method: str,
         path: str,
+        *,
         params: Optional[Dict[str, Any]] = None,
-        json: Optional[Dict[str, Any]] = None,
-        data: Any = None,
-        retries: int = 2,
-        backoff_s: float = 0.6,
-    ) -> Tuple[int, str, Any, str]:
-        """
-        Returns: (status_code, url, parsed_json_or_text, raw_text)
-        """
-        method_up = method.upper().strip()
+        json_body: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Tuple[int, Union[Dict[str, Any], Any, str]]:
+        method_u = method.upper()
+        sig = self._signature_for_method(method_u)
+        url = self._url(path)
 
-        if method_up in ("GET", "DELETE"):
-            url = self.build_get_delete_url(path, params=params)
-            headers = {}
-        elif method_up in ("POST", "PUT", "PATCH"):
-            # For write methods, auth is in Authorization header
-            if not path.startswith("/"):
-                path = "/" + path
-            url = f"{self.base_url}{path}"
-            headers = self.build_headers_for_write(method_up)
+        params = dict(params or {})
+        hdrs: Dict[str, str] = {"accept": "application/json"}
+        if headers:
+            hdrs.update(headers)
+
+        # Auth rules per docs
+        if method_u in ("GET", "DELETE"):
+            params["apikey"] = self.public_key
+            params["signature"] = sig
+        elif method_u in ("POST", "PUT", "PATCH"):
+            hdrs["Authorization"] = f"API {self.public_key}:{sig}"
+            hdrs.setdefault("content-type", "application/json")
         else:
-            raise ValueError(f"Unsupported method: {method_up}")
+            raise FourOverAPIError(f"Unsupported HTTP method: {method_u}")
 
-        last_exc: Optional[Exception] = None
-
-        for attempt in range(retries + 1):
-            try:
-                resp = self._session.request(
-                    method_up,
-                    url,
-                    headers=headers,
-                    timeout=self.timeout,
-                    params=None if method_up in ("GET", "DELETE") else params,
-                    json=json,
-                    data=data,
-                )
-                raw = resp.text or ""
-
-                # Auth errors
-                if resp.status_code in (401, 403):
-                    raise FourOverAuthError(raw[:800])
-
-                # Other errors
-                if resp.status_code >= 400:
-                    raise FourOverHTTPError(
-                        status_code=resp.status_code,
-                        message="4over_http_error",
-                        url=url,
-                        body=raw,
-                    )
-
-                # Parse JSON if possible
-                try:
-                    parsed = resp.json()
-                except Exception:
-                    parsed = raw
-
-                return resp.status_code, url, parsed, raw
-
-            except (requests.RequestException, FourOverHTTPError, FourOverAuthError) as e:
-                last_exc = e
-
-                # Retry only on network-ish errors or 5xx
-                retryable = isinstance(e, requests.RequestException)
-                if isinstance(e, FourOverHTTPError) and 500 <= e.status_code <= 599:
-                    retryable = True
-
-                if attempt >= retries or not retryable:
-                    raise
-
-                time.sleep(backoff_s * (2 ** attempt))
-
-        # should never get here
-        raise FourOverError(f"Request failed: {last_exc}")
-
-    # ---------- convenience endpoints ----------
-
-    def whoami(self) -> Any:
-        _, _, parsed, _ = self.request("GET", "/whoami")
-        return parsed
-
-    def get_categories(self, max_: int = 1000, offset: int = 0) -> Any:
-        # pagination is max/offset per docs :contentReference[oaicite:3]{index=3}
-        params = {"max": max_, "offset": offset}
-        _, _, parsed, _ = self.request("GET", "/printproducts/categories", params=params)
-        return parsed
-
-    def get_category_products(self, category_uuid: str, max_: int = 1000, offset: int = 0) -> Any:
-        params = {"max": max_, "offset": offset}
-        _, _, parsed, _ = self.request(
-            "GET",
-            f"/printproducts/categories/{category_uuid}/products",
-            params=params,
+        resp = self._session.request(
+            method=method_u,
+            url=url,
+            params=params if params else None,
+            json=json_body,
+            headers=hdrs,
+            timeout=self.timeout,
         )
-        return parsed
 
+        data = self._parse_json(resp)
 
-# ---------- factory from env ----------
+        if resp.status_code in (401, 403):
+            raise FourOverAuthError(
+                f"4over auth failed ({resp.status_code}) for {method_u} {url}. Response: {data}"
+            )
 
-def from_env() -> FourOverClient:
-    base_url = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").strip()
-    public_key = os.getenv("FOUR_OVER_APIKEY", "").strip()
-    private_key = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
+        if resp.status_code >= 400:
+            raise FourOverAPIError(
+                f"4over request failed ({resp.status_code}) for {method_u} {url}. Response: {data}"
+            )
 
-    # Reminder: DO NOT strip internal characters. Only trim outer whitespace.
-    private_key = private_key.strip()
+        return resp.status_code, data
 
-    return FourOverClient(
-        base_url=base_url,
-        public_key=public_key,
-        private_key=private_key,
-        timeout=int(os.getenv("FOUR_OVER_TIMEOUT", "30")),
-    )
+    # Convenience wrappers
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        _, data = self.request("GET", path, params=params)
+        return data
+
+    def delete(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        _, data = self.request("DELETE", path, params=params)
+        return data
+
+    def post(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        _, data = self.request("POST", path, json_body=json_body)
+        return data
+
+    def put(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        _, data = self.request("PUT", path, json_body=json_body)
+        return data
+
+    def patch(self, path: str, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        _, data = self.request("PATCH", path, json_body=json_body)
+        return data

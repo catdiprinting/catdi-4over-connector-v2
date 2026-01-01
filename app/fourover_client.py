@@ -1,20 +1,3 @@
-"""
-Backwards-compatible FourOverClient.
-
-Supports BOTH styles:
-- FourOverClient(base_url=..., apikey=..., private_key=..., timeout_seconds=...)
-- Legacy aliases:
-    public_key -> apikey
-    timeout -> timeout_seconds
-
-Implements:
-- GET / DELETE: apikey + signature in query params
-- POST / PUT / PATCH: Authorization header "API {apikey}:{signature}"
-
-Signature implementation here matches your previous v2 approach:
-    signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key).hexdigest())
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -41,70 +24,74 @@ class FourOverHTTPError(FourOverError):
 @dataclass(frozen=True)
 class FourOverConfig:
     base_url: str
-    public_key: str
+    apikey: str
     private_key: str
     timeout_seconds: int = 30
 
     @staticmethod
     def from_env() -> "FourOverConfig":
         base_url = (os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").strip().rstrip("/")
-        public_key = (os.getenv("FOUR_OVER_APIKEY") or "").strip()
+        apikey = (os.getenv("FOUR_OVER_APIKEY") or "").strip()
         private_key = (os.getenv("FOUR_OVER_PRIVATE_KEY") or "").strip()
-        timeout_seconds = int(os.getenv("FOUR_OVER_TIMEOUT", "30"))
+        timeout_seconds_raw = (os.getenv("FOUR_OVER_TIMEOUT") or "30").strip()
 
-        if not public_key:
+        try:
+            timeout_seconds = int(timeout_seconds_raw)
+        except ValueError:
+            timeout_seconds = 30
+
+        if not apikey:
             raise FourOverError("Missing env var FOUR_OVER_APIKEY")
         if not private_key:
             raise FourOverError("Missing env var FOUR_OVER_PRIVATE_KEY")
 
         return FourOverConfig(
             base_url=base_url,
-            public_key=public_key,
+            apikey=apikey,
             private_key=private_key,
             timeout_seconds=timeout_seconds,
         )
 
 
 class FourOverClient:
+    """
+    Backwards compatible constructor supports:
+      - apikey=...
+      - public_key=... (alias for apikey)
+      - timeout_seconds=...
+      - timeout=... (alias for timeout_seconds)
+
+    Signature approach here matches what you were using in v2:
+      signature = HMAC_SHA256(message=HTTP_METHOD, key=SHA256(private_key).hexdigest())
+    """
+
     def __init__(
         self,
-        config: Optional[FourOverConfig] = None,
         *,
         base_url: Optional[str] = None,
         apikey: Optional[str] = None,
-        public_key: Optional[str] = None,  # legacy alias
+        public_key: Optional[str] = None,  # alias
         private_key: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
-        timeout: Optional[int] = None,  # legacy alias
+        timeout: Optional[int] = None,  # alias
     ):
-        # normalize legacy aliases
         if apikey is None and public_key is not None:
             apikey = public_key
         if timeout_seconds is None and timeout is not None:
             timeout_seconds = timeout
 
-        if config is None:
-            if base_url is not None or apikey is not None or private_key is not None or timeout_seconds is not None:
-                # build config from explicit values (fallback to env)
-                b = (base_url or os.getenv("FOUR_OVER_BASE_URL") or "https://api.4over.com").strip().rstrip("/")
-                k = (apikey or os.getenv("FOUR_OVER_APIKEY") or "").strip()
-                pk = (private_key or os.getenv("FOUR_OVER_PRIVATE_KEY") or "").strip()
-                t = int(timeout_seconds or os.getenv("FOUR_OVER_TIMEOUT", "30"))
+        # fall back to env if values not provided
+        env = FourOverConfig.from_env()
 
-                if not k:
-                    raise FourOverError("Missing apikey / FOUR_OVER_APIKEY")
-                if not pk:
-                    raise FourOverError("Missing private_key / FOUR_OVER_PRIVATE_KEY")
+        self.base_url = (base_url or env.base_url).strip().rstrip("/")
+        self.apikey = (apikey or env.apikey).strip()
+        self.private_key = (private_key or env.private_key).strip()
+        self.timeout_seconds = int(timeout_seconds or env.timeout_seconds)
 
-                config = FourOverConfig(base_url=b, public_key=k, private_key=pk, timeout_seconds=t)
-            else:
-                config = FourOverConfig.from_env()
+        # key is SHA256(private_key).hexdigest() as string
+        self._hashed_private_hex = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
 
-        self.config = config
         self.session = requests.Session()
-
-        # docs-style used in your earlier v2: HMAC key = sha256(private_key).hexdigest() (string)
-        self._hashed_private_hex = hashlib.sha256(self.config.private_key.encode("utf-8")).hexdigest()
 
     def _signature_for_method(self, method: str) -> str:
         msg = method.upper().encode("utf-8")
@@ -125,17 +112,17 @@ class FourOverClient:
         if not path.startswith("/"):
             path = "/" + path
 
-        url = f"{self.config.base_url}{path}"
+        url = f"{self.base_url}{path}"
 
         req_params = dict(params or {})
         req_headers = dict(headers or {})
 
         if method_u in ("GET", "DELETE"):
-            req_params["apikey"] = self.config.public_key
+            req_params["apikey"] = self.apikey
             req_params["signature"] = self._signature_for_method(method_u)
         elif method_u in ("POST", "PUT", "PATCH"):
             sig = self._signature_for_method(method_u)
-            req_headers["Authorization"] = f"API {self.config.public_key}:{sig}"
+            req_headers["Authorization"] = f"API {self.apikey}:{sig}"
         else:
             raise FourOverError(f"Unsupported HTTP method: {method_u}")
 
@@ -147,14 +134,12 @@ class FourOverClient:
                 json=json,
                 data=data,
                 headers=req_headers,
-                timeout=self.config.timeout_seconds,
+                timeout=self.timeout_seconds,
             )
         except requests.RequestException as e:
             raise FourOverHTTPError(f"Network error calling 4over: {e}") from e
 
         content_type = (resp.headers.get("content-type") or "").lower()
-        body_text = resp.text
-
         parsed: Any = None
         if "application/json" in content_type:
             try:
@@ -164,24 +149,17 @@ class FourOverClient:
 
         if resp.status_code in (401, 403):
             raise FourOverAuthError(
-                f"4over auth failed ({resp.status_code}) for {method_u} {url}. "
-                f"Response: {parsed if parsed is not None else body_text}"
+                f"Auth failed ({resp.status_code}) {method_u} {url} :: "
+                f"{parsed if parsed is not None else resp.text}"
             )
 
         if resp.status_code >= 400:
             raise FourOverHTTPError(
-                f"4over http error ({resp.status_code}) for {method_u} {url}. "
-                f"Response: {parsed if parsed is not None else body_text}"
+                f"HTTP error ({resp.status_code}) {method_u} {url} :: "
+                f"{parsed if parsed is not None else resp.text}"
             )
 
-        return parsed if parsed is not None else body_text
-
-    # Convenience helpers (so your app can do c.get("/whoami"))
-    def get(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
-        return self.request("GET", path, params=params)
-
-    def post(self, path: str, *, params: Optional[Dict[str, Any]] = None, json: Optional[Any] = None) -> Any:
-        return self.request("POST", path, params=params, json=json)
+        return parsed if parsed is not None else resp.text
 
     def whoami(self) -> Any:
-        return self.get("/whoami")
+        return self.request("GET", "/whoami")

@@ -1,18 +1,12 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
-
-from fourover_client import FourOverError, whoami, product_baseprices
-from db import ensure_schema
-from doorhangers import router as doorhangers_router
+from fastapi import FastAPI, HTTPException
 
 APP_VERSION = {
     "service": "catdi-4over-connector",
     "phase": "0.9",
-    "build": "ROOT_MAIN_PY_AUTH_LOCKED_DB_SAFE",
+    "build": "SAFE_MODE_BOOT_ONLY",
 }
 
 app = FastAPI(title="Catdi 4over Connector", version="0.9")
-app.include_router(doorhangers_router)
 
 
 @app.get("/version")
@@ -32,53 +26,10 @@ def db_ping():
 
 @app.post("/db/init")
 def db_init():
-    """
-    Idempotent schema init / migration.
-    Must NEVER crash the app.
-    """
+    # Lazy import so db.py problems show as 500 (response), not as a crash (502)
     try:
+        from db import ensure_schema  # local import on purpose
         ensure_schema()
-        return {"ok": True, "tables": ["baseprice_cache"]}
+        return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": "DB init failed", "message": str(e)})
-
-
-@app.get("/4over/whoami")
-def four_over_whoami():
-    try:
-        return whoami()
-    except FourOverError as e:
-        return JSONResponse(
-            status_code=401 if e.status == 401 else 502,
-            content={
-                "detail": {
-                    "error": "4over_http_error",
-                    "status_code": e.status,
-                    "url": e.url,
-                    "body": e.body,
-                    "canonical": getattr(e, "canonical", None),
-                }
-            },
-        )
-
-
-@app.get("/doorhangers/product/{product_uuid}/baseprices")
-def doorhangers_baseprices(product_uuid: str):
-    """
-    Debug endpoint: fetch baseprices live from 4over (no DB).
-    """
-    try:
-        return product_baseprices(product_uuid)
-    except FourOverError as e:
-        return JSONResponse(
-            status_code=401 if e.status == 401 else 502,
-            content={
-                "detail": {
-                    "error": "4over_http_error",
-                    "status_code": e.status,
-                    "url": e.url,
-                    "body": e.body,
-                    "canonical": getattr(e, "canonical", None),
-                }
-            },
-        )

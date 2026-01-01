@@ -1,31 +1,21 @@
 # main.py
-import os
-from typing import Any, Dict, Optional
+from __future__ import annotations
 
-from fastapi import FastAPI, Query
+import os
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from fourover_client import FourOverClient, FourOverError, FourOverAuthError
+from fourover_client import FourOverClient, FourOverError, FourOverAuthError, from_env
 
-app = FastAPI(title="catdi-4over-connector", version="0.1.0")
+app = FastAPI(title="catdi-4over-connector", version="root-layout")
+
+client: FourOverClient | None = None
 
 
-def _env_debug() -> Dict[str, Any]:
-    apikey = os.getenv("FOUR_OVER_APIKEY")
-    pkey = os.getenv("FOUR_OVER_PRIVATE_KEY")
-    base = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com")
-
-    pkey_stripped = (pkey or "").strip()
-    return {
-        "ok": True,
-        "base_url": base,
-        "apikey_present": bool((apikey or "").strip()),
-        "private_key_present": bool((pkey or "").strip()),
-        "private_key_len": len(pkey or ""),
-        "private_key_stripped_len": len(pkey_stripped),
-        "private_key_endswith_newline": (pkey or "").endswith("\n"),
-        "note": "Signature is canonical(path+sorted_query) HMAC-SHA256 with private key",
-    }
+@app.on_event("startup")
+def startup() -> None:
+    global client
+    client = from_env()
 
 
 @app.get("/ping")
@@ -35,62 +25,115 @@ def ping():
 
 @app.get("/debug/auth")
 def debug_auth():
-    return _env_debug()
+    # Never leak keys. Just show presence + lengths.
+    pk = os.getenv("FOUR_OVER_APIKEY", "")
+    sk = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
+
+    pk_present = bool(pk.strip())
+    sk_present = bool(sk.strip())
+    sk_raw = sk
+    sk_strip = sk.strip()
+
+    base_url = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").strip()
+
+    return {
+        "ok": True,
+        "base_url": base_url,
+        "apikey_present": pk_present,
+        "private_key_present": sk_present,
+        "private_key_len": len(sk_raw),
+        "private_key_stripped_len": len(sk_strip),
+        "private_key_endswith_newline": sk_raw.endswith("\n"),
+        "note": "Signature is HMAC-SHA256(message=HTTP_METHOD, key=SHA256(private_key))",
+    }
 
 
 @app.get("/debug/sign")
-def debug_sign(product_uuid: Optional[str] = Query(default=None)):
+def debug_sign():
     """
-    Returns canonical + signature examples without making external calls.
+    Shows what signature we will use for GET requests.
+    Per 4over docs, it is based on HTTP_METHOD only, not path/query.
     """
-    client = FourOverClient.from_env()
+    if client is None:
+        return JSONResponse({"ok": False, "error": "client_not_ready"}, status_code=500)
 
-    tests = []
-    canonical, sig = client.sign("/whoami", params={})
-    tests.append({"name": "whoami", "canonical": canonical, "signature": sig})
-
-    if product_uuid:
-        canonical, sig = client.sign(
-            f"/printproducts/products/{product_uuid}/baseprices", params={}
-        )
-        tests.append(
+    return {
+        "ok": True,
+        "tests": [
             {
-                "name": f"/printproducts/products/{product_uuid}/baseprices",
-                "canonical": canonical,
-                "signature": sig,
-            }
-        )
-
-        canonical, sig = client.sign(
-            f"/printproducts/products/{product_uuid}/optiongroups", params={}
-        )
-        tests.append(
+                "name": "GET signature",
+                "method": "GET",
+                "signature": client.signature_for_method("GET"),
+            },
             {
-                "name": f"/printproducts/products/{product_uuid}/optiongroups",
-                "canonical": canonical,
-                "signature": sig,
-            }
-        )
-
-    return {"ok": True, "tests": tests}
+                "name": "POST signature",
+                "method": "POST",
+                "signature": client.signature_for_method("POST"),
+            },
+        ],
+    }
 
 
 @app.get("/4over/whoami")
 def fourover_whoami():
-    """
-    Calls 4over /whoami via signed URL.
-    """
+    if client is None:
+        return JSONResponse({"ok": False, "error": "client_not_ready"}, status_code=500)
+
     try:
-        client = FourOverClient.from_env()
         data = client.whoami()
-        return data
+        return {"ok": True, "data": data}
     except FourOverAuthError as e:
-        # return the structured JSON string if possible
-        try:
-            return JSONResponse(status_code=401, content={"ok": False, **__import__("json").loads(str(e))})
-        except Exception:
-            return JSONResponse(status_code=401, content={"ok": False, "error": "auth_failed", "detail": str(e)})
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "4over_auth_failed",
+                "status": 401,
+                "detail": str(e)[:800],
+            },
+            status_code=401,
+        )
     except FourOverError as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": "client_error", "detail": str(e)})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"ok": False, "error": "server_error", "detail": str(e)})
+        return JSONResponse(
+            {"ok": False, "error": "4over_error", "detail": str(e)[:1200]},
+            status_code=500,
+        )
+
+
+@app.get("/4over/categories")
+def fourover_categories(max: int = 1000, offset: int = 0):
+    if client is None:
+        return JSONResponse({"ok": False, "error": "client_not_ready"}, status_code=500)
+
+    try:
+        data = client.get_categories(max_=max, offset=offset)
+        return {"ok": True, "data": data}
+    except FourOverAuthError as e:
+        return JSONResponse(
+            {"ok": False, "error": "4over_auth_failed", "status": 401, "detail": str(e)[:800]},
+            status_code=401,
+        )
+    except FourOverError as e:
+        return JSONResponse(
+            {"ok": False, "error": "4over_error", "detail": str(e)[:1200]},
+            status_code=500,
+        )
+
+
+@app.get("/4over/categories/{category_uuid}/products")
+def fourover_category_products(category_uuid: str, max: int = 1000, offset: int = 0):
+    if client is None:
+        return JSONResponse({"ok": False, "error": "client_not_ready"}, status_code=500)
+
+    try:
+        data = client.get_category_products(category_uuid=category_uuid, max_=max, offset=offset)
+        return {"ok": True, "data": data}
+    except FourOverAuthError as e:
+        return JSONResponse(
+            {"ok": False, "error": "4over_auth_failed", "status": 401, "detail": str(e)[:800]},
+            status_code=401,
+        )
+    except FourOverError as e:
+        return JSONResponse(
+            {"ok": False, "error": "4over_error", "detail": str(e)[:1200]},
+            status_code=500,
+        )

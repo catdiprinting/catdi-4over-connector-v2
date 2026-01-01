@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from urllib.parse import urlencode
+from typing import Iterable, Mapping, Sequence, Tuple, Union
+from urllib.parse import quote, urlencode
 
 import requests
 
@@ -27,10 +28,46 @@ def _require_keys() -> None:
         raise RuntimeError("FOUR_OVER_PRIVATE_KEY is missing")
 
 
-def _canonical_query(params: dict) -> str:
-    # Stable ordering matters for signature reproducibility
-    items = sorted((k, str(v)) for k, v in params.items() if v is not None)
-    return urlencode(items)
+QueryParams = Union[
+    Mapping[str, object],
+    Sequence[Tuple[str, object]],
+]
+
+
+def _normalize_params(params: QueryParams) -> list[tuple[str, str]]:
+    """Normalize params into a list of (key, value_str) pairs.
+
+    Important: we support repeated keys (e.g. ``options[]``) by allowing callers
+    to pass a list of tuples.
+    """
+    items: list[tuple[str, str]] = []
+    if isinstance(params, Mapping):
+        for k, v in params.items():
+            if v is None:
+                continue
+            items.append((str(k), str(v)))
+    else:
+        for k, v in params:
+            if v is None:
+                continue
+            items.append((str(k), str(v)))
+    return items
+
+
+def _canonical_query(params: QueryParams, *, sort: bool = True) -> str:
+    """Encode query params deterministically.
+
+    - Uses RFC3986-ish encoding (spaces become %20, not '+') via ``quote``.
+    - Supports repeated keys via list-of-tuples input.
+
+    NOTE: Sorting is typically required for signature reproducibility. If 4over
+    expects the *original order* for a specific endpoint, pass ``sort=False``
+    with an already-ordered list-of-tuples.
+    """
+    items = _normalize_params(params)
+    if sort:
+        items = sorted(items, key=lambda kv: (kv[0], kv[1]))
+    return urlencode(items, doseq=True, quote_via=quote, safe="")
 
 
 def signature_for_canonical(canonical: str) -> str:
@@ -39,7 +76,8 @@ def signature_for_canonical(canonical: str) -> str:
       signature = HMAC_SHA256(canonical, private_key)
     (canonical includes path + querystring WITHOUT signature param)
     """
-    key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
+    # Railway env vars can include trailing newlines when pasted.
+    key = (FOUR_OVER_PRIVATE_KEY or "").strip().encode("utf-8")
     msg = canonical.encode("utf-8")
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
@@ -49,15 +87,25 @@ class FourOverClient:
         _require_keys()
         self.base_url = base_url.rstrip("/")
 
-    def request(self, method: str, path: str, params: dict | None = None, timeout: int = 30) -> dict:
+    def request(self, method: str, path: str, params: QueryParams | None = None, timeout: int = 30) -> dict:
         params = params or {}
-        # Build canonical params excluding signature
-        q = {"apikey": FOUR_OVER_APIKEY, **params}
-        canonical = f"{path}?{_canonical_query(q)}"
+
+        # Build canonical params excluding signature.
+        # IMPORTANT: allow repeated keys by supporting list-of-tuples.
+        if isinstance(params, Mapping):
+            q_no_sig: QueryParams = {"apikey": FOUR_OVER_APIKEY, **params}
+        else:
+            q_no_sig = [("apikey", FOUR_OVER_APIKEY), *list(params)]
+
+        canonical = f"{path}?{_canonical_query(q_no_sig)}"
         sig = signature_for_canonical(canonical)
 
         # Final URL includes signature
-        q_with_sig = {**q, "signature": sig}
+        if isinstance(q_no_sig, Mapping):
+            q_with_sig: QueryParams = {**q_no_sig, "signature": sig}
+        else:
+            q_with_sig = [*list(q_no_sig), ("signature", sig)]
+
         url = f"{self.base_url}{path}?{_canonical_query(q_with_sig)}"
 
         r = requests.request(method.upper(), url, timeout=timeout)

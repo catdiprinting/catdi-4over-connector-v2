@@ -12,6 +12,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from db import SessionLocal, init_db
 from models import BasePriceCache, BasePriceRow
 from fourover_client import FourOverClient, FourOverError
+import os
+
 from config import FOUR_OVER_BASE_URL, FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY
 
 app = FastAPI(title="Catdi 4over Connector", version="0.9")
@@ -66,8 +68,83 @@ def debug_auth():
             "base_url": FOUR_OVER_BASE_URL,
             "apikey_present": bool(FOUR_OVER_APIKEY),
             "private_key_present": bool(FOUR_OVER_PRIVATE_KEY),
+            "private_key_len": len((FOUR_OVER_PRIVATE_KEY or "")),
+            "private_key_stripped_len": len((FOUR_OVER_PRIVATE_KEY or "").strip()),
+            "private_key_endswith_newline": (FOUR_OVER_PRIVATE_KEY or "").endswith("\n"),
             "note": "Signature is canonical(path+query) HMAC-SHA256 with private key",
         }
+    except Exception as e:
+        return safe_error({"ok": False, "error": str(e), "trace": traceback.format_exc()}, status_code=500)
+
+
+@app.get("/debug/fingerprint")
+def debug_fingerprint():
+    """Single source of truth for "what code is live" + "what schema is live"."""
+    try:
+        # Build/version metadata
+        build_sha = os.getenv("RAILWAY_GIT_COMMIT_SHA") or os.getenv("GIT_COMMIT") or "unknown"
+        # Minimal schema introspection
+        schema = {"ok": True, "tables": {}, "schema_version": None}
+        with SessionLocal() as db:
+            try:
+                # PostgreSQL: query information_schema for columns
+                for table in ["baseprice_cache", "baseprice_rows"]:
+                    rows = db.execute(
+                        select(1)
+                    )
+                # Use SQLAlchemy inspector (no extra dependency)
+                from sqlalchemy import inspect
+
+                insp = inspect(db.get_bind())
+                for table in ["baseprice_cache", "baseprice_rows"]:
+                    if table in insp.get_table_names():
+                        schema["tables"][table] = [c["name"] for c in insp.get_columns(table)]
+                    else:
+                        schema["tables"][table] = None
+            except Exception as se:
+                schema = {"ok": False, "error": str(se)}
+
+        return {
+            "ok": True,
+            "service": "catdi-4over-connector",
+            "version": "0.9",
+            "build": build_sha,
+            "time": datetime.utcnow().isoformat(),
+            "auth": {
+                "base_url": FOUR_OVER_BASE_URL,
+                "apikey_present": bool(FOUR_OVER_APIKEY),
+                "private_key_present": bool(FOUR_OVER_PRIVATE_KEY),
+            },
+            "db": schema,
+        }
+    except Exception as e:
+        return safe_error({"ok": False, "error": str(e), "trace": traceback.format_exc()}, status_code=500)
+
+
+@app.get("/debug/sign")
+def debug_sign(product_uuid: str = Query(None)):
+    """Return the exact canonical strings/signatures we would send.
+
+    This lets you compare failures across endpoints without guessing.
+    """
+    try:
+        from fourover_client import _canonical_query, signature_for_canonical
+
+        tests = []
+
+        # whoami
+        canonical = f"/whoami?{_canonical_query({'apikey': FOUR_OVER_APIKEY})}"
+        tests.append({"name": "whoami", "canonical": canonical, "signature": signature_for_canonical(canonical)})
+
+        if product_uuid:
+            for path in [
+                f"/printproducts/products/{product_uuid}/baseprices",
+                f"/printproducts/products/{product_uuid}/optiongroups",
+            ]:
+                c = f"{path}?{_canonical_query({'apikey': FOUR_OVER_APIKEY})}"
+                tests.append({"name": path, "canonical": c, "signature": signature_for_canonical(c)})
+
+        return {"ok": True, "tests": tests}
     except Exception as e:
         return safe_error({"ok": False, "error": str(e), "trace": traceback.format_exc()}, status_code=500)
 

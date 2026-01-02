@@ -1,200 +1,228 @@
-# app/main.py
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import select
-from datetime import datetime
-import hashlib
 import json
+from fastapi import FastAPI, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
 
-from .db import get_db, init_db
-from .models import Category, Product, ProductBasePrice
-from .fourover_client import FourOverClient
+from app.config import SERVICE_NAME
+from app.db import Base, engine, get_db
+from app.models import Category, Product, PriceBlob
+from app.fourover_client import FourOverClient
 
-app = FastAPI(title="Catdi × 4over Connector", version="2.0.1")
+app = FastAPI(title=SERVICE_NAME)
 
-# ---- Startup ----
-@app.on_event("startup")
-def startup():
-    init_db()
+# Create tables at startup
+Base.metadata.create_all(bind=engine)
 
-def client() -> FourOverClient:
-    # Lazy client creation so app can boot even if env vars are temporarily missing
-    return FourOverClient()
 
-# ---- Health ----
-@app.get("/")
-def root():
-    return {"ok": True, "service": "catdi-4over-connector", "phase": "v2"}
+@app.get("/health")
+def health():
+    return {"ok": True, "service": SERVICE_NAME}
+
 
 @app.get("/db/ping")
 def db_ping(db: Session = Depends(get_db)):
-    db.execute(select(1))
+    db.execute("SELECT 1")
     return {"ok": True}
 
-# ---- 4over passthroughs ----
-@app.get("/4over/whoami")
-def whoami():
-    c = client()
-    res = c.get("/whoami")
-    if not res["ok"]:
-        raise HTTPException(status_code=res["http_code"], detail=res)
-    return {"ok": True, "data": res["data"]}
+
+# ----------------------------
+# 4OVER passthrough endpoints
+# ----------------------------
 
 @app.get("/4over/categories")
-def list_categories(max: int = 50, offset: int = 0):
-    c = client()
-    res = c.get("/printproducts/categories", params={"max": max, "offset": offset})
-    if not res["ok"]:
-        raise HTTPException(status_code=res["http_code"], detail=res)
-    return {"ok": True, "data": res["data"]}
+def four_over_categories(max: int = 50, offset: int = 0):
+    c = FourOverClient()
+    status, data = c.get("/printproducts/categories", {"max": max, "offset": offset})
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=data)
+    return {"ok": True, "data": data}
+
 
 @app.get("/4over/categories/{category_uuid}/products")
-def category_products(category_uuid: str, max: int = 50, offset: int = 0):
-    c = client()
+def four_over_category_products(category_uuid: str, max: int = 50, offset: int = 0):
+    c = FourOverClient()
     path = f"/printproducts/categories/{category_uuid}/products"
-    res = c.get(path, params={"max": max, "offset": offset})
-    if not res["ok"]:
-        raise HTTPException(status_code=res["http_code"], detail=res)
-    return {"ok": True, "data": res["data"]}
+    status, data = c.get(path, {"max": max, "offset": offset})
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=data)
+    return {"ok": True, "data": data}
+
 
 @app.get("/4over/products/{product_uuid}")
-def product_detail(product_uuid: str):
-    """
-    Hydrated product detail: product + option groups (and options).
-    (We store this whole JSON in DB as raw_json for calculators.)
-    """
-    c = client()
-    base = c.get(f"/printproducts/products/{product_uuid}")
-    if not base["ok"]:
-        raise HTTPException(status_code=base["http_code"], detail=base)
+def four_over_product(product_uuid: str):
+    c = FourOverClient()
+    path = f"/printproducts/products/{product_uuid}"
+    status, data = c.get(path)
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=data)
+    return {"ok": True, "data": data}
 
-    product = base["data"]
 
-    og = c.get(f"/printproducts/products/{product_uuid}/optiongroups")
-    if og["ok"] and isinstance(og["data"], dict) and "entities" in og["data"]:
-        option_groups = og["data"]["entities"]
-        # Load options for each group
-        for g in option_groups:
-            group_uuid = g.get("product_option_group_uuid") or g.get("productOptionGroupUuid") or g.get("uuid")
-            if group_uuid:
-                opts = c.get(f"/printproducts/products/{product_uuid}/optiongroups/{group_uuid}/options")
-                if opts["ok"] and isinstance(opts["data"], dict) and "entities" in opts["data"]:
-                    g["options"] = opts["data"]["entities"]
-        product["product_option_groups"] = option_groups
+# ----------------------------
+# SYNC endpoints (DB caching)
+# ----------------------------
 
-    return {"ok": True, "data": product}
+@app.post("/sync/categories")
+def sync_categories(max: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    c = FourOverClient()
+    status, payload = c.get("/printproducts/categories", {"max": max, "offset": offset})
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=payload)
 
-# These are the endpoints you tried (they were 404 on your deployed instance)
-@app.get("/4over/products/{product_uuid}/base-prices")
-def product_base_prices(product_uuid: str, max: int = 200, offset: int = 0):
-    c = client()
-    res = c.get(f"/printproducts/products/{product_uuid}/baseprices", params={"max": max, "offset": offset})
-    if not res["ok"]:
-        raise HTTPException(status_code=res["http_code"], detail=res)
-    return {"ok": True, "data": res["data"]}
+    entities = (payload or {}).get("entities", [])
+    upserted = 0
 
-@app.get("/4over/products/{product_uuid}/option-groups")
-def product_option_groups(product_uuid: str):
-    c = client()
-    res = c.get(f"/printproducts/products/{product_uuid}/optiongroups")
-    if not res["ok"]:
-        raise HTTPException(status_code=res["http_code"], detail=res)
-    return {"ok": True, "data": res["data"]}
-
-# ---- DB Sync ----
-@app.post("/sync/category/{category_uuid}")
-def sync_category(category_uuid: str, db: Session = Depends(get_db), max: int = 50, offset: int = 0):
-    """
-    Sync:
-    - category record
-    - products list in category
-    - for each product: store product raw_json + base prices
-    """
-    c = client()
-
-    # Pull category info (optional; safe even if you only have uuid)
-    cat_row = db.get(Category, category_uuid)
-    if not cat_row:
-        cat_row = Category(category_uuid=category_uuid, category_name=None, category_description=None)
-        db.add(cat_row)
-        db.commit()
-
-    # Fetch products for this category
-    res = c.get(f"/printproducts/categories/{category_uuid}/products", params={"max": max, "offset": offset})
-    if not res["ok"]:
-        raise HTTPException(status_code=res["http_code"], detail=res)
-
-    entities = res["data"].get("entities", [])
-    synced = 0
-    for p in entities:
-        puid = p.get("product_uuid")
-        if not puid:
+    for e in entities:
+        uuid = e.get("category_uuid")
+        if not uuid:
             continue
-        sync_product(puid, db=db)  # re-use below
-        synced += 1
 
-    return {"ok": True, "category_uuid": category_uuid, "synced_products": synced}
+        row = db.get(Category, uuid)
+        if not row:
+            row = Category(category_uuid=uuid)
+            db.add(row)
+
+        row.category_name = e.get("category_name") or ""
+        row.category_description = e.get("category_description")
+        row.products_url = e.get("products")
+        upserted += 1
+
+    db.commit()
+    return {"ok": True, "upserted": upserted, "max": max, "offset": offset}
+
+
+@app.post("/sync/category/{category_uuid}/products")
+def sync_category_products(
+    category_uuid: str,
+    max: int = 50,
+    offset: int = 0,
+    pull_details: bool = True,
+    pull_prices: bool = False,
+    price_limit: int = 40,  # safety cap for first run
+    db: Session = Depends(get_db),
+):
+    c = FourOverClient()
+    path = f"/printproducts/categories/{category_uuid}/products"
+    status, payload = c.get(path, {"max": max, "offset": offset})
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=payload)
+
+    entities = (payload or {}).get("entities", [])
+    upserted = 0
+
+    for e in entities:
+        puuid = e.get("product_uuid")
+        if not puuid:
+            continue
+
+        row = db.get(Product, puuid)
+        if not row:
+            row = Product(product_uuid=puuid)
+            db.add(row)
+
+        row.product_code = e.get("product_code")
+        row.product_description = e.get("product_description")
+        row.category_uuid = category_uuid
+        upserted += 1
+
+        if pull_details or pull_prices:
+            _sync_one_product(db=db, client=c, product_uuid=puuid, pull_prices=pull_prices, price_limit=price_limit)
+
+    db.commit()
+    return {
+        "ok": True,
+        "category_uuid": category_uuid,
+        "upserted_products": upserted,
+        "pull_details": pull_details,
+        "pull_prices": pull_prices,
+        "max": max,
+        "offset": offset,
+    }
+
 
 @app.post("/sync/product/{product_uuid}")
-def sync_product(product_uuid: str, db: Session = Depends(get_db)):
-    """
-    Stores:
-    - Product (uuid, code, description, raw_json)
-    - ProductBasePrice rows
-    """
-    c = client()
+def sync_product(
+    product_uuid: str,
+    pull_prices: bool = False,
+    price_limit: int = 40,
+    db: Session = Depends(get_db),
+):
+    c = FourOverClient()
+    _sync_one_product(db=db, client=c, product_uuid=product_uuid, pull_prices=pull_prices, price_limit=price_limit)
+    db.commit()
+    return {"ok": True, "product_uuid": product_uuid, "pull_prices": pull_prices, "price_limit": price_limit}
 
-    # 1) Hydrated product JSON
-    detail = product_detail(product_uuid)
-    product_json = detail["data"]
 
-    code = product_json.get("product_code")
-    desc = product_json.get("product_description")
+def _sync_one_product(db: Session, client: FourOverClient, product_uuid: str, pull_prices: bool, price_limit: int):
+    # Pull full product detail
+    status, detail = client.get(f"/printproducts/products/{product_uuid}")
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=detail)
 
     row = db.get(Product, product_uuid)
     if not row:
-        row = Product(
-            product_uuid=product_uuid,
-            product_code=code,
-            product_description=desc,
-            raw_json=json.dumps(product_json),
-            updated_at=datetime.utcnow(),
-        )
+        row = Product(product_uuid=product_uuid)
         db.add(row)
-    else:
-        row.product_code = code
-        row.product_description = desc
-        row.raw_json = json.dumps(product_json)
-        row.updated_at = datetime.utcnow()
 
-    db.commit()
+    row.product_code = detail.get("product_code")
+    row.product_description = detail.get("product_description")
+    row.detail_json = json.dumps(detail)
 
-    # 2) Base prices
-    prices_res = c.get(f"/printproducts/products/{product_uuid}/baseprices", params={"max": 500, "offset": 0})
-    if not prices_res["ok"]:
-        raise HTTPException(status_code=prices_res["http_code"], detail=prices_res)
+    if not pull_prices:
+        return
 
-    entities = prices_res["data"].get("entities", [])
+    # Collect option_prices URLs from detail JSON
+    urls = []
+    for og in detail.get("product_option_groups", []) or []:
+        for opt in og.get("options", []) or []:
+            u = opt.get("option_prices")
+            if u:
+                urls.append(u)
 
-    # Clear old prices for this product (simple + safe for now)
-    db.query(ProductBasePrice).filter(ProductBasePrice.product_uuid == product_uuid).delete()
-    db.commit()
+    # Deduplicate, cap
+    urls = list(dict.fromkeys(urls))[: max(0, int(price_limit))]
 
-    inserted = 0
-    for e in entities:
-        # We build a deterministic UUID for the row from the JSON blob
-        blob = json.dumps(e, sort_keys=True).encode("utf-8")
-        base_price_uuid = hashlib.sha1(blob).hexdigest()
+    for u in urls:
+        status2, price_json = client.get_by_full_url(u)
+        if status2 >= 400:
+            # keep going; don't kill whole sync
+            continue
 
         db.add(
-            ProductBasePrice(
-                base_price_uuid=base_price_uuid,
+            PriceBlob(
                 product_uuid=product_uuid,
-                raw_json=json.dumps(e),
-                updated_at=datetime.utcnow(),
+                option_prices_url=u,
+                price_json=json.dumps(price_json),
             )
         )
-        inserted += 1
 
-    db.commit()
-    return {"ok": True, "product_uuid": product_uuid, "base_prices_inserted": inserted}
+
+@app.get("/db/products/{product_uuid}")
+def db_get_product(product_uuid: str, db: Session = Depends(get_db)):
+    row = db.get(Product, product_uuid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "ok": True,
+        "product_uuid": row.product_uuid,
+        "product_code": row.product_code,
+        "product_description": row.product_description,
+        "category_uuid": row.category_uuid,
+        "has_detail_json": bool(row.detail_json),
+    }
+
+
+@app.get("/db/products/{product_uuid}/prices")
+def db_get_prices(product_uuid: str, limit: int = 25, db: Session = Depends(get_db)):
+    q = (
+        db.query(PriceBlob)
+        .filter(PriceBlob.product_uuid == product_uuid)
+        .order_by(PriceBlob.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "ok": True,
+        "product_uuid": product_uuid,
+        "count": len(q),
+        "items": [{"id": r.id, "url": r.option_prices_url, "fetched_at": r.fetched_at} for r in q],
+    }

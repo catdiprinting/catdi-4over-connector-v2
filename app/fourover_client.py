@@ -1,92 +1,62 @@
-# app/fourover_client.py
-import hmac
 import hashlib
-import os
-from urllib.parse import urlencode
+import hmac
+import time
 import requests
+from urllib.parse import urlparse
+from app.config import (
+    FOUR_OVER_BASE_URL,
+    FOUR_OVER_APIKEY,
+    FOUR_OVER_PRIVATE_KEY,
+    FOUR_OVER_TIMEOUT,
+)
 
 
 class FourOverClient:
-    """
-    4over auth (working approach):
-      - query always includes apikey
-      - signature = HMAC-SHA256(private_key, canonical_string)
-      - canonical_string = <path>?<sorted querystring>
-      - DO NOT add timestamps unless the docs explicitly require them.
-    """
-
     def __init__(self):
-        self.base_url = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
-        self.api_prefix = os.getenv("FOUR_OVER_API_PREFIX", "printproducts").strip("/")
+        if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
+            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
 
-        self.apikey = os.getenv("FOUR_OVER_APIKEY", "")
-        self.private_key = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
-
-        timeout = os.getenv("FOUR_OVER_TIMEOUT", "30")
-        try:
-            self.timeout = int(timeout)
-        except Exception:
-            self.timeout = 30
-
-        if not self.apikey or not self.private_key:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY in env")
-
-    def _normalize_path(self, path: str) -> str:
-        """
-        Ensures we call:
-          https://api.4over.com/<api_prefix>/<path_without_prefix>
-        """
-        if not path.startswith("/"):
-            path = "/" + path
-
-        # Strip prefix if caller already included it (prevents /printproducts/printproducts/...)
-        pref = f"/{self.api_prefix}"
-        if path.startswith(pref + "/"):
-            path = path[len(pref):]  # remove leading /printproducts
-
-        # Final API path always includes prefix once
-        return f"/{self.api_prefix}{path}"
+        # Normalize + strip secrets (Railway env vars can include trailing newlines/spaces)
+        self.base = (FOUR_OVER_BASE_URL or "").rstrip("/")
+        self.apikey = (FOUR_OVER_APIKEY or "").strip()
+        self.private_key = (FOUR_OVER_PRIVATE_KEY or "").strip().encode("utf-8")
 
     def _sign(self, canonical: str) -> str:
-        return hmac.new(
-            self.private_key.encode("utf-8"),
-            canonical.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
+        """
+        4over signature is HMAC-SHA256(private_key, canonical_string)
+        """
+        digest = hmac.new(self.private_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        return digest
 
-    def get(self, path: str, params: dict | None = None):
-        params = dict(params or {})
+    def _request(self, method: str, path: str, params=None):
+        params = params or {}
+
+        # 4over signing: include apikey in the canonical string.
+        # IMPORTANT: Do NOT add extra params (like timestamp) unless 4over explicitly requires them,
+        # otherwise their server-side signature validation will fail.
         params["apikey"] = self.apikey
 
-        api_path = self._normalize_path(path)
+        # Canonical string is path + '?' + sorted query string (apikey & timestamp included)
+        # We'll build it the same way the request URL is built.
+        # NOTE: requests will encode params. We keep it simple and stable by sorting.
+        items = sorted(params.items(), key=lambda x: x[0])
+        query = "&".join([f"{k}={v}" for k, v in items])
+        canonical = f"{path}?{query}"
 
-        # IMPORTANT: stable ordering for signature
-        qs = urlencode(sorted(params.items()), doseq=True)
+        sig = self._sign(canonical)
+        params["signature"] = sig
 
-        canonical = f"{api_path}?{qs}"
-        signature = self._sign(canonical)
+        url = f"{self.base}{path}"
 
-        url = f"{self.base_url}{api_path}?{qs}&signature={signature}"
+        resp = requests.request(method, url, params=params, timeout=FOUR_OVER_TIMEOUT)
+        return resp.status_code, resp.json() if resp.content else None
 
-        resp = requests.get(url, timeout=self.timeout)
-        try:
-            return resp.status_code, resp.json()
-        except Exception:
-            return resp.status_code, {"raw": resp.text}
+    def get(self, path: str, params=None):
+        return self._request("GET", path, params=params)
 
-    def post(self, path: str, json_body: dict | None = None, params: dict | None = None):
-        params = dict(params or {})
-        params["apikey"] = self.apikey
-
-        api_path = self._normalize_path(path)
-        qs = urlencode(sorted(params.items()), doseq=True)
-        canonical = f"{api_path}?{qs}"
-        signature = self._sign(canonical)
-
-        url = f"{self.base_url}{api_path}?{qs}&signature={signature}"
-
-        resp = requests.post(url, json=json_body or {}, timeout=self.timeout)
-        try:
-            return resp.status_code, resp.json()
-        except Exception:
-            return resp.status_code, {"raw": resp.text}
+    def get_by_full_url(self, full_url: str, params=None):
+        """
+        If 4over returns a full URL in payload, use it safely.
+        """
+        u = urlparse(full_url)
+        return self.get(u.path, params=params)

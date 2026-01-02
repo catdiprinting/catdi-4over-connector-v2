@@ -1,51 +1,59 @@
-from sqlalchemy import Column, String, Integer, Text, DateTime, func, Index
+from sqlalchemy import Column, Integer, String, Text, DateTime, func, UniqueConstraint
 from app.db import Base
 
 
 class Category(Base):
     __tablename__ = "categories"
 
-    category_uuid = Column(String, primary_key=True)
-    category_name = Column(String, nullable=False)
-    category_description = Column(String, nullable=True)
+    id = Column(Integer, primary_key=True)
+    category_uuid = Column(String(64), unique=True, index=True, nullable=False)
+    category_name = Column(String(255), nullable=False)
+    category_description = Column(Text, nullable=True)
     products_url = Column(Text, nullable=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 class Product(Base):
     __tablename__ = "products"
 
-    product_uuid = Column(String, primary_key=True)
-    product_code = Column(String, nullable=True, index=True)
+    id = Column(Integer, primary_key=True)
+    product_uuid = Column(String(64), unique=True, index=True, nullable=False)
+    product_code = Column(String(255), index=True, nullable=True)
     product_description = Column(Text, nullable=True)
 
-    # category (denormalized quick filter)
-    category_uuid = Column(String, nullable=True, index=True)
+    # primary category (optional) – for Door Hangers etc.
+    category_uuid = Column(String(64), index=True, nullable=True)
 
-    # store the full product JSON from /printproducts/products/{uuid}
-    detail_json = Column(Text, nullable=True)
+    # urls (handy for debugging)
+    full_product_path = Column(Text, nullable=True)
+    option_groups_url = Column(Text, nullable=True)
+    base_prices_url = Column(Text, nullable=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 class PriceBlob(Base):
     """
-    Cache raw price JSON responses from 4over option price URLs.
-    This avoids guessing the matrix schema too early.
+    Stores pricing responses / option pricing payloads as JSON text.
+    This is the scalable approach: keep raw payloads first, normalize later.
     """
     __tablename__ = "price_blobs"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-
-    product_uuid = Column(String, nullable=False, index=True)
-    option_prices_url = Column(Text, nullable=False)
-    price_json = Column(Text, nullable=False)
-
-    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
-
     __table_args__ = (
-        Index("ix_price_blobs_product_url", "product_uuid", "option_prices_url"),
+        UniqueConstraint("product_uuid", "blob_type", "fingerprint", name="uq_priceblob"),
     )
+
+    id = Column(Integer, primary_key=True)
+    product_uuid = Column(String(64), index=True, nullable=False)
+
+    # e.g. "baseprices", "product_detail", "option_prices"
+    blob_type = Column(String(64), index=True, nullable=False)
+
+    # helps avoid duplicates; can be option_uuid or hash key
+    fingerprint = Column(String(255), nullable=False)
+
+    json_text = Column(Text, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

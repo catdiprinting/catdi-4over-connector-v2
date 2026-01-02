@@ -1,303 +1,204 @@
-import json
-from decimal import Decimal
-
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
+import json
 
-from app.db import init_db, get_db
-from app.models import Category, Product, ProductCategory, ProductDetail, BasePriceRow
+from app.db import get_db, init_db
 from app.fourover_client import FourOverClient
-from app.config import DEFAULT_MARKUP_PCT
+from app import models
 
-app = FastAPI(title="catdi-4over-connector", version="v2-db-sync")
+app = FastAPI(title="catdi-4over-connector", version="1.0")
 
 client = FourOverClient()
 
 
-@app.get("/ping")
-def ping():
-    return {"ok": True, "service": "catdi-4over-connector-v2", "phase": "db-sync"}
-
-
-@app.post("/db/init")
-def db_init():
+@app.on_event("startup")
+def _startup():
     init_db()
-    return {"ok": True, "message": "DB initialized (tables created if missing)"}
 
+
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "catdi-4over-connector"}
+
+
+@app.get("/db/ping")
+def db_ping(db: Session = Depends(get_db)):
+    try:
+        db.execute("SELECT 1")
+        return {"ok": True, "db": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/auth")
+def debug_auth():
+    # don't leak secrets; just confirm presence
+    from app.config import FOUR_OVER_BASE_URL, FOUR_OVER_API_PREFIX, FOUR_OVER_TIMEOUT, FOUR_OVER_APIKEY, FOUR_OVER_PRIVATE_KEY
+    return {
+        "FOUR_OVER_BASE_URL": FOUR_OVER_BASE_URL,
+        "FOUR_OVER_API_PREFIX": FOUR_OVER_API_PREFIX,
+        "FOUR_OVER_APIKEY_present": bool(FOUR_OVER_APIKEY),
+        "FOUR_OVER_PRIVATE_KEY_present": bool(FOUR_OVER_PRIVATE_KEY),
+        "FOUR_OVER_TIMEOUT": str(FOUR_OVER_TIMEOUT),
+    }
+
+
+# ----------------------------
+# 4over passthrough endpoints
+# ----------------------------
 
 @app.get("/4over/whoami")
 def whoami():
-    code, data = client.get("/whoami")
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": data}
-    return {"ok": True, "data": data}
+    r = client.get("/whoami")
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    return {"ok": r.ok, "http_code": r.status_code, "data": data}
 
 
 @app.get("/4over/categories")
-def categories(max: int = Query(50), offset: int = Query(0)):
-    code, data = client.get("/categories", params={"max": max, "offset": offset})
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": data}
-    return {"ok": True, "data": data}
+def categories(max: int = 50, offset: int = 0):
+    r = client.get("/categories", params={"max": max, "offset": offset})
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    return {"ok": r.ok, "http_code": r.status_code, "data": data}
 
 
 @app.get("/4over/categories/{category_uuid}/products")
-def category_products(category_uuid: str, max: int = Query(50), offset: int = Query(0)):
-    path = f"/categories/{category_uuid}/products"
-    code, data = client.get(path, params={"max": max, "offset": offset})
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": data}
-    return {"ok": True, "data": data}
+def category_products(category_uuid: str, max: int = 50, offset: int = 0):
+    r = client.get(f"/categories/{category_uuid}/products", params={"max": max, "offset": offset})
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    return {"ok": r.ok, "http_code": r.status_code, "data": data}
 
 
 @app.get("/4over/products/{product_uuid}")
 def product_details(product_uuid: str):
-    path = f"/products/{product_uuid}"
-    code, data = client.get(path)
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": data}
-    return {"ok": True, "data": data}
+    r = client.get(f"/products/{product_uuid}")
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    return {"ok": r.ok, "http_code": r.status_code, "data": data}
 
 
-# ✅ THIS is what your curl was missing:
 @app.get("/4over/products/{product_uuid}/base-prices")
-def product_base_prices(product_uuid: str, max: int = Query(200), offset: int = Query(0)):
-    path = f"/products/{product_uuid}/baseprices"
-    code, data = client.get(path, params={"max": max, "offset": offset})
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": data}
-    return {"ok": True, "data": data}
+def product_base_prices(product_uuid: str, max: int = 200, offset: int = 0):
+    r = client.get(f"/products/{product_uuid}/baseprices", params={"max": max, "offset": offset})
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    return {"ok": r.ok, "http_code": r.status_code, "data": data}
 
 
-# --------------------------
-# SYNC: Categories → Products → Product Details → Base Prices
-# --------------------------
+# ----------------------------
+# Sync into DB (scalable)
+# ----------------------------
 
 @app.post("/sync/categories")
-def sync_categories(db: Session = Depends(get_db), max: int = Query(50), offset: int = Query(0)):
-    code, payload = client.get("/categories", params={"max": max, "offset": offset})
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": payload}
-
-    entities = payload.get("entities", [])
-    upserts = 0
-
-    for c in entities:
-        row = db.get(Category, c["category_uuid"])
-        if not row:
-            row = Category(category_uuid=c["category_uuid"])
-            db.add(row)
-        row.category_name = c.get("category_name") or ""
-        row.category_description = c.get("category_description")
-        upserts += 1
-
-    db.commit()
-    return {"ok": True, "upserts": upserts, "page": payload.get("currentPage"), "totalResults": payload.get("totalResults")}
-
-
-@app.post("/sync/category/{category_uuid}/products")
-def sync_category_products(category_uuid: str, db: Session = Depends(get_db), max: int = Query(50), offset: int = Query(0)):
-    path = f"/categories/{category_uuid}/products"
-    code, payload = client.get(path, params={"max": max, "offset": offset})
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": payload}
-
-    entities = payload.get("entities", [])
-    upserts = 0
-    links = 0
-
-    # ensure category exists
-    if not db.get(Category, category_uuid):
-        db.add(Category(category_uuid=category_uuid, category_name="(unknown)", category_description=None))
-        db.commit()
-
-    for p in entities:
-        puid = p["product_uuid"]
-        prod = db.get(Product, puid)
-        if not prod:
-            prod = Product(product_uuid=puid)
-            db.add(prod)
-        prod.product_code = p.get("product_code")
-        prod.product_description = p.get("product_description")
-        upserts += 1
-
-        # link
-        existing = db.query(ProductCategory).filter_by(product_uuid=puid, category_uuid=category_uuid).first()
-        if not existing:
-            db.add(ProductCategory(product_uuid=puid, category_uuid=category_uuid))
-            links += 1
-
-    db.commit()
-    return {"ok": True, "products_upserted": upserts, "links_added": links, "page": payload.get("currentPage"), "totalResults": payload.get("totalResults")}
-
-
-@app.post("/sync/product/{product_uuid}")
-def sync_product_detail(product_uuid: str, db: Session = Depends(get_db)):
-    code, payload = client.get(f"/products/{product_uuid}")
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": payload}
-
-    # upsert product
-    prod = db.get(Product, product_uuid)
-    if not prod:
-        prod = Product(product_uuid=product_uuid)
-        db.add(prod)
-
-    prod.product_code = payload.get("product_code")
-    prod.product_description = payload.get("product_description")
-
-    # upsert raw details
-    details = db.get(ProductDetail, product_uuid)
-    if not details:
-        details = ProductDetail(product_uuid=product_uuid, raw_json=json.dumps(payload))
-        db.add(details)
-    else:
-        details.raw_json = json.dumps(payload)
-
-    db.commit()
-    return {"ok": True, "product_uuid": product_uuid, "stored": True}
-
-
-@app.post("/sync/product/{product_uuid}/base-prices")
-def sync_product_base_prices(product_uuid: str, db: Session = Depends(get_db)):
-    # Pull multiple pages safely
-    max_page = 200
+def sync_categories(pages: int = 1, page_size: int = 200, db: Session = Depends(get_db)):
+    """
+    Pull categories and upsert into DB.
+    """
     offset = 0
-    inserted = 0
-    updated = 0
+    total = 0
+    for _ in range(pages):
+        r = client.get("/categories", params={"max": page_size, "offset": offset})
+        if not r.ok:
+            raise HTTPException(status_code=502, detail={"ok": False, "http_code": r.status_code, "response": r.json() if r.text else r.text})
 
-    while True:
-        code, payload = client.get(f"/products/{product_uuid}/baseprices", params={"max": max_page, "offset": offset})
-        if code >= 400:
-            return {"ok": False, "http_code": code, "data": payload, "offset": offset}
-
-        entities = payload.get("entities", []) or []
+        payload = r.json()
+        entities = payload.get("entities") or payload.get("data", {}).get("entities") or []
         if not entities:
             break
 
-        for r in entities:
-            base_price_uuid = r.get("base_price_uuid") or r.get("base_price_uuid".replace("_", ""))  # defensive
-            if not base_price_uuid:
-                # sometimes payload uses base_price_uuid exactly, so this is just safety
-                base_price_uuid = r.get("base_price_uuid")
-
-            existing = db.query(BasePriceRow).filter_by(product_uuid=product_uuid, base_price_uuid=base_price_uuid).first()
-            if not existing:
-                existing = BasePriceRow(product_uuid=product_uuid, base_price_uuid=base_price_uuid)
-                db.add(existing)
-                inserted += 1
-            else:
-                updated += 1
-
-            # map fields (based on your PDF docs snippet)
-            existing.product_baseprice = Decimal(str(r.get("product_baseprice", "0")))
-            existing.runsize_uuid = r.get("runsize_uuid")
-            existing.runsize = r.get("runsize")
-            existing.colorspec_uuid = r.get("colorspec_uuid")
-            existing.colorspec = r.get("colorspec")
-            existing.can_group_ship = r.get("can_group_ship")
-            existing.raw_json = json.dumps(r)
+        for c in entities:
+            cu = c.get("category_uuid")
+            if not cu:
+                continue
+            obj = db.get(models.Category, cu) or models.Category(category_uuid=cu)
+            obj.category_name = c.get("category_name") or ""
+            obj.category_description = c.get("category_description")
+            db.add(obj)
+            total += 1
 
         db.commit()
+        offset += page_size
 
-        # pagination
-        total = payload.get("totalResults")
-        offset += len(entities)
-        if total is not None and offset >= int(total):
-            break
-
-    return {"ok": True, "product_uuid": product_uuid, "inserted": inserted, "updated": updated}
+    return {"ok": True, "synced": total}
 
 
-@app.post("/sync/doorhangers")
-def sync_doorhangers(db: Session = Depends(get_db)):
+@app.post("/sync/products/{product_uuid}")
+def sync_product(product_uuid: str, db: Session = Depends(get_db)):
     """
-    Door Hangers category_uuid (from your curl output):
-    5cacc269-e6a8-472d-91d6-792c4584cae8
+    Pull ONE product details + option groups + base prices and store.
     """
-    category_uuid = "5cacc269-e6a8-472d-91d6-792c4584cae8"
+    # 1) details
+    r = client.get(f"/products/{product_uuid}")
+    if not r.ok:
+        raise HTTPException(status_code=502, detail={"ok": False, "http_code": r.status_code, "response": r.json() if r.text else r.text})
+    detail = r.json()
 
-    # 1) Sync first page of categories to ensure category table exists (optional)
-    # 2) Sync all products in door hangers category
-    max_page = 50
-    offset = 0
-    total_products_seen = 0
-    product_uuids = []
+    # product core
+    prod = db.get(models.Product, product_uuid) or models.Product(product_uuid=product_uuid)
+    prod.product_code = detail.get("product_code") or ""
+    prod.product_description = detail.get("product_description")
 
-    while True:
-        code, payload = client.get(f"/categories/{category_uuid}/products", params={"max": max_page, "offset": offset})
-        if code >= 400:
-            return {"ok": False, "http_code": code, "data": payload, "offset": offset}
+    # category (first one)
+    cats = detail.get("categories") or []
+    if cats:
+        cu = cats[0].get("category_uuid")
+        if cu:
+            cat = db.get(models.Category, cu) or models.Category(category_uuid=cu, category_name=cats[0].get("category_name") or cu)
+            db.add(cat)
+            prod.category_uuid = cu
 
-        entities = payload.get("entities", []) or []
-        if not entities:
-            break
+    db.add(prod)
+    db.commit()
 
-        # upsert page into DB + collect UUIDs
-        for p in entities:
-            puid = p["product_uuid"]
-            product_uuids.append(puid)
+    # 2) option groups
+    # wipe existing groups/options for clean replace
+    db.query(models.OptionGroup).filter(models.OptionGroup.product_uuid == product_uuid).delete()
+    db.commit()
 
-        # write page rows into DB
-        sync_category_products(category_uuid, db, max=max_page, offset=offset)
+    for g in detail.get("product_option_groups") or []:
+        og = models.OptionGroup(
+            product_uuid=product_uuid,
+            group_uuid=g.get("product_option_group_uuid") or "",
+            group_name=g.get("product_option_group_name"),
+            minoccurs=str(g.get("minoccurs")) if g.get("minoccurs") is not None else None,
+            maxoccurs=str(g.get("maxoccurs")) if g.get("maxoccurs") is not None else None,
+        )
+        db.add(og)
+        db.flush()  # gives og.id
 
-        total = payload.get("totalResults")
-        offset += len(entities)
-        total_products_seen += len(entities)
+        for opt in g.get("options") or []:
+            o = models.Option(
+                group_id=og.id,
+                option_uuid=opt.get("option_uuid") or "",
+                option_name=opt.get("option_name"),
+                option_description=opt.get("option_description"),
+            )
+            db.add(o)
 
-        if total is not None and offset >= int(total):
-            break
+    db.commit()
 
-    # For a “test but real” run: sync details + baseprices for first N products.
-    # Change this to sync all once you're comfortable.
-    N = 10
-    synced = []
-    for puid in product_uuids[:N]:
-        sync_product_detail(puid, db)
-        sync_product_base_prices(puid, db)
-        synced.append(puid)
+    # 3) base prices (store raw rows; we can normalize later)
+    db.query(models.BasePrice).filter(models.BasePrice.product_uuid == product_uuid).delete()
+    db.commit()
 
-    return {"ok": True, "category_uuid": category_uuid, "products_found": len(product_uuids), "products_synced_now": len(synced), "synced_sample": synced}
+    rp = client.get(f"/products/{product_uuid}/baseprices", params={"max": 500, "offset": 0})
+    if rp.ok:
+        prices_payload = rp.json()
+        # Store whole payload so nothing is lost
+        bp = models.BasePrice(product_uuid=product_uuid, raw_json=json.dumps(prices_payload))
+        db.add(bp)
+        db.commit()
 
-
-# --------------------------
-# CALCULATOR (DB-backed)
-# --------------------------
-
-@app.get("/calc/doorhangers")
-def calc_doorhangers(
-    product_uuid: str,
-    runsize: str,
-    colorspec: str,
-    markup_pct: float = DEFAULT_MARKUP_PCT,
-    db: Session = Depends(get_db),
-):
-    """
-    DB-backed price lookup:
-    - finds matching base price row by runsize + colorspec (human readable)
-    - returns cost + sell price with markup
-    """
-    row = (
-        db.query(BasePriceRow)
-        .filter(BasePriceRow.product_uuid == product_uuid)
-        .filter(BasePriceRow.runsize == runsize)
-        .filter(BasePriceRow.colorspec == colorspec)
-        .first()
-    )
-
-    if not row:
-        return {"ok": False, "error": "no_price_found_in_db", "product_uuid": product_uuid, "runsize": runsize, "colorspec": colorspec}
-
-    cost = Decimal(str(row.product_baseprice))
-    sell = cost * (Decimal("1.0") + Decimal(str(markup_pct)))
-
-    return {
-        "ok": True,
-        "product_uuid": product_uuid,
-        "runsize": runsize,
-        "colorspec": colorspec,
-        "cost": float(cost),
-        "markup_pct": markup_pct,
-        "sell": float(sell),
-        "base_price_uuid": row.base_price_uuid,
-    }
+    return {"ok": True, "product_uuid": product_uuid, "stored": {"product": True, "option_groups": True, "base_prices": rp.ok}}

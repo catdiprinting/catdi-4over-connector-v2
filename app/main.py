@@ -1,170 +1,193 @@
-from fastapi import FastAPI, HTTPException, Query
-from app.fourover_client import FourOverClient
+import os
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
+
+from fourover_client import FourOverClient
 
 app = FastAPI(title="catdi-4over-connector")
 
 
-# ----------------
-# Health + debug
-# ----------------
+def safe_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": resp.text}
+
+
+def ok(resp, data):
+    return {"ok": True, "http_code": resp.status_code, "data": data}
+
+
+def fail(resp, data):
+    # normalize to your style
+    # Some 4over errors return {status:"error", ...}
+    return {"ok": False, "http_code": resp.status_code, "data": data}
+
+
+def api_path(path: str) -> str:
+    """
+    Builds /printproducts/... paths.
+    """
+    prefix = os.getenv("FOUR_OVER_API_PREFIX", "printproducts").strip("/")
+    return f"/{prefix}/{path.lstrip('/')}"
+
+
+def fetch_product_and_prices(client: FourOverClient, product_uuid: str):
+    """
+    Returns (product_json, baseprices_json).
+    """
+    product_resp = client.get(api_path(f"products/{product_uuid}"))
+    product_json = safe_json(product_resp)
+
+    base_resp = client.get(api_path(f"products/{product_uuid}/baseprices"), params={"max": 500, "offset": 0})
+    base_json = safe_json(base_resp)
+
+    return product_json, base_json
+
+
+def build_matrix(product_json: dict, baseprices_json: dict):
+    """
+    Takes the product detail json and baseprices json and returns:
+      - product metadata
+      - options grouped by friendly names
+      - baseprices entities
+    """
+    out = {
+        "product_uuid": product_json.get("product_uuid"),
+        "product_code": product_json.get("product_code"),
+        "description": product_json.get("product_description"),
+        "options": {},
+        "baseprices": baseprices_json.get("entities", []),
+    }
+
+    option_groups = product_json.get("product_option_groups", []) or []
+    for og in option_groups:
+        name = (og.get("product_option_group_name") or "").strip()
+        options = og.get("options", []) or []
+
+        key = name.lower().replace(" ", "_")
+        if not key:
+            continue
+
+        out["options"][key] = options
+
+    return out
+
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "service": "catdi-4over-connector",
-        "build": "matrix-quote-v1",
-    }
+    return {"ok": True, "service": "catdi-4over-connector", "build": os.getenv("BUILD_TAG", "matrix-quote-v1")}
 
 
 @app.get("/debug/auth")
 def debug_auth():
+    """
+    Shows that env vars are present and signatures are stable (without leaking keys).
+    """
     try:
-        client = FourOverClient()
-        sig = client._signature("GET")
+        c = FourOverClient()
+        # sample canonical strings
+        canonical_get = "/whoami?apikey=" + c.apikey
+        sig_get = c._hmac_sha256(canonical_get)
+
+        canonical_post = "/printproducts/orders"
+        sig_post = c._hmac_sha256(canonical_post)
+
         return {
-            "ok": True,
-            "apikey_present": True,
-            "private_key_present": True,
-            "sig_sample": sig[:12] + "...",
-            "base_test_url": "https://web-production-009a.up.railway.app/4over/whoami",
+            "base_url": c.base_url,
+            "api_prefix": c.api_prefix,
+            "timeout": c.timeout,
+            "apikey_present": bool(c.apikey),
+            "private_key_present": bool(c.private_key),
+            "apikey_edge": c.apikey[:5],
+            "private_key_len": len(c.private_key),
+            "sig_GET_edge": f"{sig_get[:6]}...{sig_get[-6:]}",
+            "sig_POST_edge": f"{sig_post[:6]}...{sig_post[-6:]}",
+            "note": "GET uses query auth; POST uses Authorization: API apikey:signature",
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
-
-# ----------------
-# 4over passthrough
-# ----------------
 
 @app.get("/4over/whoami")
 def whoami():
-    client = FourOverClient()
-    r = client.get("/whoami")
-    return {"ok": r.ok, "http_code": r.status_code, "data": r.json()}
+    try:
+        client = FourOverClient()
+        resp = client.get("/whoami")
+        data = safe_json(resp)
+        if resp.status_code >= 400:
+            return fail(resp, data)
+        return ok(resp, data)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
 @app.get("/4over/categories")
-def categories(max: int = 50, offset: int = 0):
-    client = FourOverClient()
-    r = client.get("/categories", params={"max": max, "offset": offset})
-    return {"ok": r.ok, "http_code": r.status_code, "data": r.json()}
+def categories(max: int = Query(50), offset: int = Query(0)):
+    try:
+        client = FourOverClient()
+        resp = client.get(api_path("categories"), params={"max": max, "offset": offset})
+        data = safe_json(resp)
+        if resp.status_code >= 400:
+            return fail(resp, data)
+        return ok(resp, data)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
 @app.get("/4over/categories/{category_uuid}/products")
-def category_products(category_uuid: str, max: int = 50, offset: int = 0):
-    client = FourOverClient()
-    r = client.get(
-        f"/categories/{category_uuid}/products",
-        params={"max": max, "offset": offset},
-    )
-    return {"ok": r.ok, "http_code": r.status_code, "data": r.json()}
+def category_products(category_uuid: str, max: int = Query(25), offset: int = Query(0)):
+    try:
+        client = FourOverClient()
+        resp = client.get(api_path(f"categories/{category_uuid}/products"), params={"max": max, "offset": offset})
+        data = safe_json(resp)
+        if resp.status_code >= 400:
+            return fail(resp, data)
+        return ok(resp, data)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
 @app.get("/4over/products/{product_uuid}")
-def product_details(product_uuid: str):
-    client = FourOverClient()
-    r = client.get(f"/products/{product_uuid}")
-    return {"ok": r.ok, "http_code": r.status_code, "data": r.json()}
+def product_detail(product_uuid: str):
+    """
+    Returns product details INCLUDING option groups by calling /printproducts/products/{uuid}
+    """
+    try:
+        client = FourOverClient()
+        resp = client.get(api_path(f"products/{product_uuid}"))
+        data = safe_json(resp)
+        if resp.status_code >= 400:
+            return fail(resp, data)
+        return ok(resp, data)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 
 @app.get("/4over/products/{product_uuid}/base-prices")
-def product_base_prices(product_uuid: str, max: int = 200, offset: int = 0):
-    client = FourOverClient()
-    r = client.get(
-        f"/products/{product_uuid}/baseprices",
-        params={"max": max, "offset": offset},
-    )
-    return {"ok": r.ok, "http_code": r.status_code, "data": r.json()}
+def product_base_prices(product_uuid: str, max: int = Query(200), offset: int = Query(0)):
+    """
+    Calls /printproducts/products/{uuid}/baseprices
+    """
+    try:
+        client = FourOverClient()
+        resp = client.get(api_path(f"products/{product_uuid}/baseprices"), params={"max": max, "offset": offset})
+        data = safe_json(resp)
+        if resp.status_code >= 400:
+            return fail(resp, data)
+        return ok(resp, data)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
-
-# ----------------
-# Helpers
-# ----------------
-
-def fetch_product_and_prices(client: FourOverClient, product_uuid: str):
-    p = client.get(f"/products/{product_uuid}")
-    if not p.ok:
-        raise HTTPException(status_code=500, detail="Product fetch failed")
-
-    b = client.get(
-        f"/products/{product_uuid}/baseprices",
-        params={"max": 1000, "offset": 0},
-    )
-    if not b.ok:
-        raise HTTPException(status_code=500, detail="Baseprice fetch failed")
-
-    return p.json(), b.json()
-
-
-def group_map(product: dict):
-    gm = {}
-    for g in product.get("product_option_groups", []):
-        name = g.get("product_option_group_name")
-        if name:
-            gm[name.lower()] = g
-    return gm
-
-
-# ----------------
-# MATRIX endpoint
-# ----------------
 
 @app.get("/matrix/{product_uuid}")
 def matrix(product_uuid: str):
-    client = FourOverClient()
-    product, baseprices = fetch_product_and_prices(client, product_uuid)
+    """
+    Returns a friendly “matrix” object: option groups + base prices.
+    """
+    try:
+        client = FourOverClient()
+        product_json, baseprices_json = fetch_product_and_prices(client, product_uuid)
 
-    groups = group_map(product)
-
-    def options(group_name: str):
-        g = groups.get(group_name.lower())
-        if not g:
-            return []
-        return g.get("options", [])
-
-    return {
-        "product_uuid": product.get("product_uuid"),
-        "product_code": product.get("product_code"),
-        "description": product.get("product_description"),
-        "options": {
-            "size": options("Size"),
-            "stock": options("Stock"),
-            "coating": options("Coating"),
-            "colorspec": options("Colorspec"),
-            "runsize": options("Runsize"),
-            "turnaround": options("Turn Around Time"),
-        },
-        "baseprices": baseprices.get("entities", []),
-    }
-
-
-# ----------------
-# QUOTE endpoint
-# ----------------
-
-@app.get("/quote")
-def quote(
-    product_uuid: str = Query(...),
-    runsize: str = Query(...),
-    colorspec: str = Query(...),
-):
-    client = FourOverClient()
-    _, baseprices = fetch_product_and_prices(client, product_uuid)
-
-    for row in baseprices.get("entities", []):
-        if str(row.get("runsize")) == str(runsize) and str(row.get("colorspec")) == str(colorspec):
-            return {
-                "ok": True,
-                "product_uuid": product_uuid,
-                "runsize": runsize,
-                "colorspec": colorspec,
-                "base_price": row.get("product_baseprice"),
-                "base_price_uuid": row.get("base_price_uuid"),
-            }
-
-    return {
-        "ok": False,
-        "message": "No matching base price found",
-        "hint": "Use /matrix/{product_uuid} to see valid combinations",
-    }
+        # If either call returned error style, bubble it up
+        if isinstance(product_json, dict) and product_json.get("status

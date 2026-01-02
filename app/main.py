@@ -35,7 +35,7 @@ def whoami():
 
 @app.get("/4over/categories")
 def categories(max: int = Query(50), offset: int = Query(0)):
-    code, data = client.get("/printproducts/categories", params={"max": max, "offset": offset})
+    code, data = client.get("/categories", params={"max": max, "offset": offset})
     if code >= 400:
         return {"ok": False, "http_code": code, "data": data}
     return {"ok": True, "data": data}
@@ -43,7 +43,7 @@ def categories(max: int = Query(50), offset: int = Query(0)):
 
 @app.get("/4over/categories/{category_uuid}/products")
 def category_products(category_uuid: str, max: int = Query(50), offset: int = Query(0)):
-    path = f"/printproducts/categories/{category_uuid}/products"
+    path = f"/categories/{category_uuid}/products"
     code, data = client.get(path, params={"max": max, "offset": offset})
     if code >= 400:
         return {"ok": False, "http_code": code, "data": data}
@@ -52,18 +52,7 @@ def category_products(category_uuid: str, max: int = Query(50), offset: int = Qu
 
 @app.get("/4over/products/{product_uuid}")
 def product_details(product_uuid: str):
-    path = f"/printproducts/products/{product_uuid}"
-    code, data = client.get(path)
-    if code >= 400:
-        return {"ok": False, "http_code": code, "data": data}
-    return {"ok": True, "data": data}
-
-
-# Convenience endpoint: option groups as a standalone call
-@app.get("/4over/products/{product_uuid}/option-groups")
-def product_option_groups(product_uuid: str):
-    """Returns raw option-groups for a single product."""
-    path = f"/printproducts/products/{product_uuid}/optiongroups"
+    path = f"/products/{product_uuid}"
     code, data = client.get(path)
     if code >= 400:
         return {"ok": False, "http_code": code, "data": data}
@@ -73,7 +62,7 @@ def product_option_groups(product_uuid: str):
 # ✅ THIS is what your curl was missing:
 @app.get("/4over/products/{product_uuid}/base-prices")
 def product_base_prices(product_uuid: str, max: int = Query(200), offset: int = Query(0)):
-    path = f"/printproducts/products/{product_uuid}/baseprices"
+    path = f"/products/{product_uuid}/baseprices"
     code, data = client.get(path, params={"max": max, "offset": offset})
     if code >= 400:
         return {"ok": False, "http_code": code, "data": data}
@@ -86,7 +75,7 @@ def product_base_prices(product_uuid: str, max: int = Query(200), offset: int = 
 
 @app.post("/sync/categories")
 def sync_categories(db: Session = Depends(get_db), max: int = Query(50), offset: int = Query(0)):
-    code, payload = client.get("/printproducts/categories", params={"max": max, "offset": offset})
+    code, payload = client.get("/categories", params={"max": max, "offset": offset})
     if code >= 400:
         return {"ok": False, "http_code": code, "data": payload}
 
@@ -108,7 +97,7 @@ def sync_categories(db: Session = Depends(get_db), max: int = Query(50), offset:
 
 @app.post("/sync/category/{category_uuid}/products")
 def sync_category_products(category_uuid: str, db: Session = Depends(get_db), max: int = Query(50), offset: int = Query(0)):
-    path = f"/printproducts/categories/{category_uuid}/products"
+    path = f"/categories/{category_uuid}/products"
     code, payload = client.get(path, params={"max": max, "offset": offset})
     if code >= 400:
         return {"ok": False, "http_code": code, "data": payload}
@@ -144,7 +133,7 @@ def sync_category_products(category_uuid: str, db: Session = Depends(get_db), ma
 
 @app.post("/sync/product/{product_uuid}")
 def sync_product_detail(product_uuid: str, db: Session = Depends(get_db)):
-    code, payload = client.get(f"/printproducts/products/{product_uuid}")
+    code, payload = client.get(f"/products/{product_uuid}")
     if code >= 400:
         return {"ok": False, "http_code": code, "data": payload}
 
@@ -169,12 +158,6 @@ def sync_product_detail(product_uuid: str, db: Session = Depends(get_db)):
     return {"ok": True, "product_uuid": product_uuid, "stored": True}
 
 
-# Alias (plural) because it's easy to type and older cURL examples used it
-@app.post("/sync/products/{product_uuid}")
-def sync_products_detail_alias(product_uuid: str, db: Session = Depends(get_db)):
-    return sync_product_detail(product_uuid, db)
-
-
 @app.post("/sync/product/{product_uuid}/base-prices")
 def sync_product_base_prices(product_uuid: str, db: Session = Depends(get_db)):
     # Pull multiple pages safely
@@ -184,7 +167,7 @@ def sync_product_base_prices(product_uuid: str, db: Session = Depends(get_db)):
     updated = 0
 
     while True:
-        code, payload = client.get(f"/printproducts/products/{product_uuid}/baseprices", params={"max": max_page, "offset": offset})
+        code, payload = client.get(f"/products/{product_uuid}/baseprices", params={"max": max_page, "offset": offset})
         if code >= 400:
             return {"ok": False, "http_code": code, "data": payload, "offset": offset}
 
@@ -242,7 +225,7 @@ def sync_doorhangers(db: Session = Depends(get_db)):
     product_uuids = []
 
     while True:
-        code, payload = client.get(f"/printproducts/categories/{category_uuid}/products", params={"max": max_page, "offset": offset})
+        code, payload = client.get(f"/categories/{category_uuid}/products", params={"max": max_page, "offset": offset})
         if code >= 400:
             return {"ok": False, "http_code": code, "data": payload, "offset": offset}
 

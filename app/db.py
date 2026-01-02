@@ -1,21 +1,19 @@
-import os
+# app/db.py
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+from .config import DATABASE_URL
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
+db_url = DATABASE_URL or "sqlite:///./local.db"
 
-# Railway Postgres URLs sometimes start with postgres:// which SQLAlchemy wants as postgresql://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Railway Postgres sometimes uses postgres:// which SQLAlchemy wants as postgresql://
+if db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    future=True,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
-)
+connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+engine = create_engine(db_url, connect_args=connect_args, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 Base = declarative_base()
 
 
@@ -25,8 +23,3 @@ def get_db():
         yield db
     finally:
         db.close()
-
-
-def init_db():
-    from app import models  # noqa: F401
-    Base.metadata.create_all(bind=engine)

@@ -10,25 +10,19 @@ from .config import (
     FOUR_OVER_TIMEOUT,
 )
 
-
 class FourOverClient:
     """
-    Correct 4over client.
     Signature = HMAC_SHA256(HTTP_METHOD, SHA256(private_key))
-    GET requests send apikey + signature as query params.
+    GET uses apikey + signature as query params.
 
     IMPORTANT:
-    - Some endpoints are ROOT (e.g. /whoami) -> no prefix
-    - Catalog endpoints are under /printproducts -> use prefix
+    - ROOT endpoints like /whoami must NOT use /printproducts prefix
+    - Catalog endpoints DO use /printproducts prefix
     """
 
     def __init__(self):
         self.base = FOUR_OVER_BASE_URL
         self.prefix = FOUR_OVER_API_PREFIX  # e.g. "/printproducts" or ""
-
-        self._hmac_key = hashlib.sha256(
-            FOUR_OVER_PRIVATE_KEY.encode("utf-8")
-        ).digest()
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -36,9 +30,19 @@ class FourOverClient:
             "User-Agent": "catdi-4over-connector",
         })
 
+    def _require_auth(self):
+        if not FOUR_OVER_APIKEY:
+            raise RuntimeError("FOUR_OVER_APIKEY is missing/blank.")
+        if not FOUR_OVER_PRIVATE_KEY:
+            raise RuntimeError("FOUR_OVER_PRIVATE_KEY is missing/blank.")
+
+    def _hmac_key(self) -> bytes:
+        # compute on demand so missing key doesn't crash import
+        return hashlib.sha256(FOUR_OVER_PRIVATE_KEY.encode("utf-8")).digest()
+
     def _signature(self, method: str) -> str:
         return hmac.new(
-            self._hmac_key,
+            self._hmac_key(),
             method.upper().encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -51,21 +55,15 @@ class FourOverClient:
         return f"{self.base}{path}"
 
     def get(self, path: str, params: dict | None = None, use_prefix: bool = False):
-        """
-        use_prefix=False -> calls BASE + path (for /whoami and other root endpoints)
-        use_prefix=True  -> calls BASE + PREFIX + path (for /categories, etc.)
-        """
+        self._require_auth()
+
         query = dict(params or {})
         query["apikey"] = FOUR_OVER_APIKEY
         query["signature"] = self._signature("GET")
 
         url = self._build_url(path, use_prefix=use_prefix)
 
-        r = self.session.get(
-            url,
-            params=query,
-            timeout=FOUR_OVER_TIMEOUT,
-        )
+        r = self.session.get(url, params=query, timeout=FOUR_OVER_TIMEOUT)
 
         content_type = (r.headers.get("content-type") or "").lower()
         data = r.json() if "application/json" in content_type else r.text
@@ -76,6 +74,5 @@ class FourOverClient:
             "url": r.url,
             "data": data,
         }
-
 
 client = FourOverClient()

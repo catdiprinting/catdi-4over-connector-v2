@@ -1,84 +1,94 @@
-from sqlalchemy import Column, String, Text, Integer, ForeignKey, UniqueConstraint, Index
-from sqlalchemy.orm import relationship
-from app.db import Base
+import hashlib
+import hmac
+from urllib.parse import urlencode, quote
+
+import requests
+
+from app.config import (
+    FOUR_OVER_BASE_URL,
+    FOUR_OVER_API_PREFIX,
+    FOUR_OVER_TIMEOUT,
+    FOUR_OVER_APIKEY,
+    FOUR_OVER_PRIVATE_KEY,
+)
 
 
-class Category(Base):
-    __tablename__ = "categories"
+class FourOverClient:
+    def __init__(self):
+        if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
+            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
 
-    category_uuid = Column(String, primary_key=True)
-    category_name = Column(String, nullable=False)
-    category_description = Column(Text, nullable=True)
+        self.base_url = FOUR_OVER_BASE_URL.rstrip("/")
+        self.prefix = (FOUR_OVER_API_PREFIX or "").strip("/")
 
-    products = relationship("Product", back_populates="category")
+        self.apikey = FOUR_OVER_APIKEY.strip()
+        self.private_key = FOUR_OVER_PRIVATE_KEY.strip()
+        self.timeout = int(FOUR_OVER_TIMEOUT)
 
+    def _api_path(self, path: str) -> str:
+        """
+        whoami lives at root: /whoami
+        catalog lives under prefix: /printproducts/...
+        """
+        if not path.startswith("/"):
+            path = "/" + path
 
-class Product(Base):
-    __tablename__ = "products"
+        if path.startswith("/whoami"):
+            return path
 
-    product_uuid = Column(String, primary_key=True)
-    product_code = Column(String, index=True, nullable=False)
-    product_description = Column(Text, nullable=True)
+        # If already prefixed, don't double it
+        if self.prefix and path.startswith(f"/{self.prefix}/"):
+            return path
 
-    category_uuid = Column(String, ForeignKey("categories.category_uuid"), nullable=True)
-    category = relationship("Category", back_populates="products")
+        if self.prefix:
+            return f"/{self.prefix}{path}"
+        return path
 
-    option_groups = relationship("OptionGroup", back_populates="product", cascade="all, delete-orphan")
-    base_prices = relationship("BasePrice", back_populates="product", cascade="all, delete-orphan")
+    def _canonical(self, api_path: str, params: dict | None) -> str:
+        """
+        Canonical string = "<path>?apikey=...&<params...>"
+        apikey FIRST. Do not reorder user-supplied params.
+        """
+        pairs = [("apikey", self.apikey)]
+        if params:
+            for k, v in params.items():
+                if v is None:
+                    continue
+                pairs.append((str(k), str(v)))
 
-    __table_args__ = (
-        Index("ix_products_category_uuid", "category_uuid"),
-    )
+        qs = urlencode(pairs, quote_via=quote)
+        return f"{api_path}?{qs}"
 
+    def _sign(self, canonical: str) -> str:
+        return hmac.new(
+            self.private_key.encode("utf-8"),
+            canonical.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
-class OptionGroup(Base):
-    __tablename__ = "option_groups"
+    def get(self, path: str, params: dict | None = None):
+        api_path = self._api_path(path)
+        canonical = self._canonical(api_path, params)
+        signature = self._sign(canonical)
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    product_uuid = Column(String, ForeignKey("products.product_uuid"), nullable=False)
+        url = f"{self.base_url}{api_path}"
+        r = requests.get(
+            url,
+            params={"apikey": self.apikey, **(params or {}), "signature": signature},
+            timeout=self.timeout,
+        )
+        return r
 
-    group_uuid = Column(String, nullable=False)
-    group_name = Column(String, nullable=True)
-    minoccurs = Column(String, nullable=True)
-    maxoccurs = Column(String, nullable=True)
+    def post(self, path: str, json: dict | None = None, params: dict | None = None):
+        api_path = self._api_path(path)
+        canonical = self._canonical(api_path, params)
+        signature = self._sign(canonical)
 
-    product = relationship("Product", back_populates="option_groups")
-    options = relationship("Option", back_populates="group", cascade="all, delete-orphan")
-
-    __table_args__ = (
-        UniqueConstraint("product_uuid", "group_uuid", name="uq_option_groups_product_groupuuid"),
-        Index("ix_option_groups_product_uuid", "product_uuid"),
-    )
-
-
-class Option(Base):
-    __tablename__ = "options"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    group_id = Column(Integer, ForeignKey("option_groups.id"), nullable=False)
-
-    option_uuid = Column(String, nullable=False)
-    option_name = Column(String, nullable=True)
-    option_description = Column(Text, nullable=True)
-
-    group = relationship("OptionGroup", back_populates="options")
-
-    __table_args__ = (
-        UniqueConstraint("group_id", "option_uuid", name="uq_options_group_optionuuid"),
-        Index("ix_options_group_id", "group_id"),
-    )
-
-
-class BasePrice(Base):
-    __tablename__ = "base_prices"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    product_uuid = Column(String, ForeignKey("products.product_uuid"), nullable=False)
-
-    # store raw row as JSON string for now (scalable + safe)
-    # later we can normalize into a true pricing matrix table
-    raw_json = Column(Text, nullable=False)
-
-    product = relationship("Product", back_populates="base_prices")
-
-    __table_args__ = (Index("ix_base_prices_product_uuid", "product_uuid"),)
+        url = f"{self.base_url}{api_path}"
+        r = requests.post(
+            url,
+            params={"apikey": self.apikey, **(params or {}), "signature": signature},
+            json=json,
+            timeout=self.timeout,
+        )
+        return r

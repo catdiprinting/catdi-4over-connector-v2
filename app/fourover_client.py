@@ -1,148 +1,61 @@
-from __future__ import annotations
-
 import hashlib
 import hmac
-import os
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
+import time
 import requests
-
-
-class FourOverError(Exception):
-    pass
-
-
-class FourOverAuthError(FourOverError):
-    pass
-
-
-class FourOverHTTPError(FourOverError):
-    pass
-
-
-@dataclass(frozen=True)
-class FourOverConfig:
-    base_url: str
-    apikey: str
-    private_key: str
-    timeout_seconds: int = 30
-    api_prefix: str = ""  # e.g. "" or "/printproducts"
-
-    @staticmethod
-    def from_env() -> "FourOverConfig":
-        def s(name: str, default: str = "") -> str:
-            v = os.getenv(name)
-            return default if v is None else v.strip()
-
-        def i(name: str, default: int) -> int:
-            raw = s(name, "")
-            try:
-                return int(raw) if raw else default
-            except ValueError:
-                return default
-
-        base_url = s("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
-        apikey = s("FOUR_OVER_APIKEY", "")
-        private_key = s("FOUR_OVER_PRIVATE_KEY", "")
-        timeout_seconds = i("FOUR_OVER_TIMEOUT", 30)
-
-        # This lets us adapt quickly if 4over endpoints are under /printproducts
-        api_prefix = s("FOUR_OVER_API_PREFIX", "").strip()
-        if api_prefix and not api_prefix.startswith("/"):
-            api_prefix = "/" + api_prefix
-        api_prefix = api_prefix.rstrip("/")
-
-        if not apikey:
-            raise FourOverError("Missing FOUR_OVER_APIKEY")
-        if not private_key:
-            raise FourOverError("Missing FOUR_OVER_PRIVATE_KEY")
-
-        return FourOverConfig(
-            base_url=base_url,
-            apikey=apikey,
-            private_key=private_key,
-            timeout_seconds=timeout_seconds,
-            api_prefix=api_prefix,
-        )
+from urllib.parse import urlparse
+from app.config import (
+    FOUR_OVER_BASE_URL,
+    FOUR_OVER_APIKEY,
+    FOUR_OVER_PRIVATE_KEY,
+    FOUR_OVER_TIMEOUT,
+)
 
 
 class FourOverClient:
-    """
-    Signature mode (based on your older v2/PHP trait evidence):
-      signature = HMAC_SHA256(method, key=SHA256(private_key).hexdigest())
+    def __init__(self):
+        if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
+            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
 
-    GET/DELETE: apikey + signature in query params
-    POST/PUT/PATCH: Authorization: API {apikey}:{signature}
+        self.base = FOUR_OVER_BASE_URL
+        self.apikey = FOUR_OVER_APIKEY
+        self.private_key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
 
-    If 4over requires a different canonical signature, we update ONLY _signature_for_method().
-    """
+    def _sign(self, canonical: str) -> str:
+        """
+        4over signature is HMAC-SHA256(private_key, canonical_string)
+        """
+        digest = hmac.new(self.private_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        return digest
 
-    def __init__(self, config: Optional[FourOverConfig] = None):
-        self.config = config or FourOverConfig.from_env()
-        self.session = requests.Session()
-        self._hashed_private_hex = hashlib.sha256(self.config.private_key.encode("utf-8")).hexdigest()
+    def _request(self, method: str, path: str, params=None):
+        params = params or {}
 
-    def _signature_for_method(self, method: str) -> str:
-        msg = method.upper().encode("utf-8")
-        key = self._hashed_private_hex.encode("utf-8")
-        return hmac.new(key, msg, hashlib.sha256).hexdigest()
+        # Add apikey + timestamp
+        ts = str(int(time.time()))
+        params["apikey"] = self.apikey
+        params["timestamp"] = ts
 
-    def _full_path(self, path: str) -> str:
-        if not path.startswith("/"):
-            path = "/" + path
-        # apply optional prefix such as /printproducts
-        if self.config.api_prefix:
-            return f"{self.config.api_prefix}{path}"
-        return path
+        # Canonical string is path + '?' + sorted query string (apikey & timestamp included)
+        # We'll build it the same way the request URL is built.
+        # NOTE: requests will encode params. We keep it simple and stable by sorting.
+        items = sorted(params.items(), key=lambda x: x[0])
+        query = "&".join([f"{k}={v}" for k, v in items])
+        canonical = f"{path}?{query}"
 
-    def request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, json: Any = None) -> Any:
-        m = method.upper()
-        full_path = self._full_path(path)
-        url = f"{self.config.base_url}{full_path}"
+        sig = self._sign(canonical)
+        params["signature"] = sig
 
-        req_params = dict(params or {})
-        req_headers: Dict[str, str] = {}
+        url = f"{self.base}{path}"
 
-        if m in ("GET", "DELETE"):
-            req_params["apikey"] = self.config.apikey
-            req_params["signature"] = self._signature_for_method(m)
-        elif m in ("POST", "PUT", "PATCH"):
-            sig = self._signature_for_method(m)
-            req_headers["Authorization"] = f"API {self.config.apikey}:{sig}"
-        else:
-            raise FourOverError(f"Unsupported method: {m}")
+        resp = requests.request(method, url, params=params, timeout=FOUR_OVER_TIMEOUT)
+        return resp.status_code, resp.json() if resp.content else None
 
-        try:
-            resp = self.session.request(
-                method=m,
-                url=url,
-                params=req_params,
-                json=json,
-                headers=req_headers,
-                timeout=self.config.timeout_seconds,
-            )
-        except requests.RequestException as e:
-            raise FourOverHTTPError(f"Network error: {e}") from e
+    def get(self, path: str, params=None):
+        return self._request("GET", path, params=params)
 
-        ct = (resp.headers.get("content-type") or "").lower()
-        data: Any = None
-        if "application/json" in ct:
-            try:
-                data = resp.json()
-            except Exception:
-                data = None
-
-        if resp.status_code in (401, 403):
-            raise FourOverAuthError(f"Auth failed {resp.status_code} {m} {url}: {data if data is not None else resp.text}")
-
-        if resp.status_code >= 400:
-            raise FourOverHTTPError(f"HTTP {resp.status_code} {m} {url}: {data if data is not None else resp.text}")
-
-        return data if data is not None else resp.text
-
-    def get(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Any:
-        return self.request("GET", path, params=params)
-
-    def post(self, path: str, *, params: Optional[Dict[str, Any]] = None, json: Any = None) -> Any:
-        return self.request("POST", path, params=params, json=json)
+    def get_by_full_url(self, full_url: str, params=None):
+        """
+        If 4over returns a full URL in payload, use it safely.
+        """
+        u = urlparse(full_url)
+        return self.get(u.path, params=params)

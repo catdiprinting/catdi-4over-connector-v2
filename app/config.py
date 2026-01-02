@@ -1,21 +1,32 @@
 import os
 
-def require(name: str, default: str | None = None) -> str:
-    val = os.getenv(name, default)
-    if not val or not val.strip():
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val.strip()
+def env(name: str, default: str = "") -> str:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip()
 
-FOUR_OVER_BASE_URL = require(
-    "FOUR_OVER_BASE_URL",
-    "https://api.4over.com"
-).rstrip("/")
+def env_int(name: str, default: int) -> int:
+    raw = env(name, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
 
-FOUR_OVER_APIKEY = require("FOUR_OVER_APIKEY")
-FOUR_OVER_PRIVATE_KEY = require("FOUR_OVER_PRIVATE_KEY")
+# DB (do NOT hard-fail at import time)
+DATABASE_URL = env("DATABASE_URL", "").strip()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# 4over (do NOT hard-fail at import time; validate per-request)
+FOUR_OVER_BASE_URL = env("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
+FOUR_OVER_API_PREFIX = env("FOUR_OVER_API_PREFIX", "").strip()  # e.g. "printproducts"
+FOUR_OVER_APIKEY = env("FOUR_OVER_APIKEY", "")
+FOUR_OVER_PRIVATE_KEY = env("FOUR_OVER_PRIVATE_KEY", "")
+FOUR_OVER_TIMEOUT = env_int("FOUR_OVER_TIMEOUT", 30)
 
-FOUR_OVER_TIMEOUT = int(os.getenv("FOUR_OVER_TIMEOUT", "30"))
+# Normalize prefix to "" or "/something" without trailing slash
+if FOUR_OVER_API_PREFIX:
+    if not FOUR_OVER_API_PREFIX.startswith("/"):
+        FOUR_OVER_API_PREFIX = "/" + FOUR_OVER_API_PREFIX
+    FOUR_OVER_API_PREFIX = FOUR_OVER_API_PREFIX.rstrip("/")

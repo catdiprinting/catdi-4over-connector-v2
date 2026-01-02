@@ -1,61 +1,89 @@
+# app/fourover_client.py
 import hashlib
 import hmac
+import os
 import time
+from typing import Any, Dict, Optional
 import requests
-from urllib.parse import urlparse
-from app.config import (
-    FOUR_OVER_BASE_URL,
-    FOUR_OVER_APIKEY,
-    FOUR_OVER_PRIVATE_KEY,
-    FOUR_OVER_TIMEOUT,
-)
 
 
 class FourOverClient:
-    def __init__(self):
-        if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
+    """
+    Minimal 4over REST client using apikey + HMAC signature.
 
-        self.base = FOUR_OVER_BASE_URL
-        self.apikey = FOUR_OVER_APIKEY
-        self.private_key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
+    IMPORTANT:
+    - We do NOT raise at import/startup if env vars are missing.
+    - We validate right before making a request so the app can boot even if env is misconfigured.
+    """
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        private_key: Optional[str] = None,
+        timeout: int = 60,
+    ):
+        self.base_url = (base_url or os.getenv("FOUR_OVER_BASE_URL") or "").rstrip("/")
+        self.api_key = api_key or os.getenv("FOUR_OVER_APIKEY")
+        self.private_key = private_key or os.getenv("FOUR_OVER_PRIVATE_KEY")
+        self.timeout = timeout
+
+    def _require_config(self):
+        if not self.base_url:
+            raise RuntimeError("Missing FOUR_OVER_BASE_URL")
+        if not self.api_key:
+            raise RuntimeError("Missing FOUR_OVER_APIKEY")
+        if not self.private_key:
+            raise RuntimeError("Missing FOUR_OVER_PRIVATE_KEY")
 
     def _sign(self, canonical: str) -> str:
-        """
-        4over signature is HMAC-SHA256(private_key, canonical_string)
-        """
-        digest = hmac.new(self.private_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
-        return digest
+        # 4over signature = HMAC-SHA256(private_key, canonical)
+        return hmac.new(
+            self.private_key.encode("utf-8"),
+            canonical.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
-    def _request(self, method: str, path: str, params=None):
-        params = params or {}
+    def request(self, method: str, path_or_url: str, params: Optional[dict] = None) -> Dict[str, Any]:
+        self._require_config()
 
-        # Add apikey + timestamp
-        ts = str(int(time.time()))
-        params["apikey"] = self.apikey
-        params["timestamp"] = ts
+        # Accept either "/whoami" or full URL from API payloads
+        if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+            url = path_or_url
+            # canonical should be only path + query string (without domain)
+            # Example: https://api.4over.com/whoami?apikey=...
+            # We rebuild canonical from parsed URL.
+            from urllib.parse import urlparse
 
-        # Canonical string is path + '?' + sorted query string (apikey & timestamp included)
-        # We'll build it the same way the request URL is built.
-        # NOTE: requests will encode params. We keep it simple and stable by sorting.
-        items = sorted(params.items(), key=lambda x: x[0])
-        query = "&".join([f"{k}={v}" for k, v in items])
-        canonical = f"{path}?{query}"
+            parsed = urlparse(url)
+            path = parsed.path
+        else:
+            path = path_or_url if path_or_url.startswith("/") else f"/{path_or_url}"
+            url = f"{self.base_url}{path}"
 
-        sig = self._sign(canonical)
-        params["signature"] = sig
+        params = dict(params or {})
+        params["apikey"] = self.api_key
 
-        url = f"{self.base}{path}"
+        # canonical = path + '?' + sorted querystring (apikey included)
+        # requests will encode query; we build our own canonical ordering.
+        from urllib.parse import urlencode
 
-        resp = requests.request(method, url, params=params, timeout=FOUR_OVER_TIMEOUT)
-        return resp.status_code, resp.json() if resp.content else None
+        canonical_qs = urlencode(sorted(params.items()), doseq=True)
+        canonical = f"{path}?{canonical_qs}"
 
-    def get(self, path: str, params=None):
-        return self._request("GET", path, params=params)
+        signature = self._sign(canonical)
+        params["signature"] = signature
 
-    def get_by_full_url(self, full_url: str, params=None):
-        """
-        If 4over returns a full URL in payload, use it safely.
-        """
-        u = urlparse(full_url)
-        return self.get(u.path, params=params)
+        r = requests.request(method, url, params=params, timeout=self.timeout)
+        # 4over often returns JSON; if not JSON, raise with text
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {"raw": r.text}
+
+        if r.status_code >= 400:
+            return {"ok": False, "http_code": r.status_code, "response": payload, "debug": {"url": r.url, "canonical": canonical}}
+        return {"ok": True, "http_code": r.status_code, "data": payload, "debug": {"url": r.url, "canonical": canonical}}
+
+    def get(self, path_or_url: str, params: Optional[dict] = None) -> Dict[str, Any]:
+        return self.request("GET", path_or_url, params=params)

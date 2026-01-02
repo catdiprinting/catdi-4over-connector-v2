@@ -1,32 +1,30 @@
 import json
-from fastapi import FastAPI, Depends, HTTPException, Query
+from decimal import Decimal
+
+from fastapi import FastAPI, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
-from app.config import SERVICE_NAME, FOUR_OVER_BASE_URL, FOUR_OVER_API_PREFIX
-from app.db import Base, engine, get_db
-from app.models import Category, Product, PriceBlob
+from app.db import init_db, get_db, db_ping
+from app.models import Category, Product, ProductCategory, ProductDetail, BasePriceRow
 from app.fourover_client import FourOverClient
+from app.config import FOUR_OVER_BASE_URL, FOUR_OVER_API_PREFIX
 
-app = FastAPI(title=SERVICE_NAME, version="bridge")
-
-
-# Create tables on boot (simple + reliable for now)
-Base.metadata.create_all(bind=engine)
+app = FastAPI(title="catdi-4over-connector", version="v2-stable-sync")
+client = FourOverClient()
 
 
-def client() -> FourOverClient:
-    return FourOverClient()
-
+# -----------------------
+# Health + Debug
+# -----------------------
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": SERVICE_NAME}
+    return {"ok": True, "service": "catdi-4over-connector"}
 
 
 @app.get("/ping")
 def ping():
-    return {"ok": True, "service": SERVICE_NAME, "phase": "bridge"}
+    return {"ok": True, "service": "catdi-4over-connector", "phase": "v2-stable-sync"}
 
 
 @app.get("/debug/auth")
@@ -34,244 +32,267 @@ def debug_auth():
     return {
         "FOUR_OVER_BASE_URL": FOUR_OVER_BASE_URL,
         "FOUR_OVER_API_PREFIX": FOUR_OVER_API_PREFIX,
-        "FOUR_OVER_APIKEY_present": True if __import__("app.config").config.FOUR_OVER_APIKEY else False,
-        "FOUR_OVER_PRIVATE_KEY_present": True if __import__("app.config").config.FOUR_OVER_PRIVATE_KEY else False,
-        "FOUR_OVER_TIMEOUT": str(__import__("app.config").config.FOUR_OVER_TIMEOUT),
+        "FOUR_OVER_APIKEY_present": bool(client.ready),
+        "FOUR_OVER_PRIVATE_KEY_present": bool(client.ready),
+        "FOUR_OVER_TIMEOUT": "30",
     }
 
 
 @app.get("/db/ping")
-def db_ping(db: Session = Depends(get_db)):
-    try:
-        db.execute(text("SELECT 1"))
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB ping failed: {type(e).__name__}: {e}")
+def ping_db():
+    ok, detail = db_ping()
+    if not ok:
+        # return 500 but with actual error detail so we can fix it fast
+        raise HTTPException(status_code=500, detail={"ok": False, "error": detail})
+    return {"ok": True, "db": "ok"}
 
 
-# ---------------------------
-# 4OVER PROXY ENDPOINTS
-# ---------------------------
+@app.post("/db/init")
+def db_init():
+    init_db()
+    return {"ok": True, "message": "DB initialized (tables created if missing)"}
+
+
+# -----------------------
+# 4over passthroughs
+# -----------------------
 
 @app.get("/4over/whoami")
 def whoami():
-    c = client()
-    out = c.get("/whoami")
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
-    return {"ok": True, "data": out["data"]}
+    # whoami is NOT under printproducts
+    code, data = client.get("whoami", use_prefix=False)
+    if code >= 400:
+        return {"ok": False, "http_code": code, "data": data}
+    return {"ok": True, "data": data}
 
 
 @app.get("/4over/categories")
-def categories(max: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
-    c = client()
-    out = c.get("/printproducts/categories", params={"max": max, "offset": offset})
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
-    return {"ok": True, "data": out["data"]}
+def categories(max: int = Query(50), offset: int = Query(0)):
+    code, data = client.get("categories", params={"max": max, "offset": offset}, use_prefix=True)
+    if code >= 400:
+        return {"ok": False, "http_code": code, "data": data}
+    return {"ok": True, "data": data}
 
 
 @app.get("/4over/categories/{category_uuid}/products")
-def category_products(category_uuid: str, max: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
-    c = client()
-    out = c.get(f"/printproducts/categories/{category_uuid}/products", params={"max": max, "offset": offset})
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
-    return {"ok": True, "data": out["data"]}
+def category_products(category_uuid: str, max: int = Query(50), offset: int = Query(0)):
+    path = f"categories/{category_uuid}/products"
+    code, data = client.get(path, params={"max": max, "offset": offset}, use_prefix=True)
+    if code >= 400:
+        return {"ok": False, "http_code": code, "data": data}
+    return {"ok": True, "data": data}
 
 
 @app.get("/4over/products/{product_uuid}")
-def product_detail(product_uuid: str):
-    """
-    This returns product + option groups in one shot (what you pasted).
-    """
-    c = client()
-    out = c.get(f"/printproducts/products/{product_uuid}")
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
-    return {"ok": True, "data": out["data"]}
+def product_details(product_uuid: str):
+    path = f"products/{product_uuid}"
+    code, data = client.get(path, use_prefix=True)
+    if code >= 400:
+        return {"ok": False, "http_code": code, "data": data}
+    return {"ok": True, "data": data}
 
 
-@app.get("/4over/products/{product_uuid}/baseprices")
-def product_base_prices(product_uuid: str):
-    """
-    Many products expose a base prices endpoint:
-      /printproducts/products/{uuid}/baseprices
-    """
-    c = client()
-    out = c.get(f"/printproducts/products/{product_uuid}/baseprices")
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
-    return {"ok": True, "data": out["data"]}
+@app.get("/4over/products/{product_uuid}/base-prices")
+def product_base_prices(product_uuid: str, max: int = Query(200), offset: int = Query(0)):
+    path = f"products/{product_uuid}/baseprices"
+    code, data = client.get(path, params={"max": max, "offset": offset}, use_prefix=True)
+    if code >= 400:
+        return {"ok": False, "http_code": code, "data": data}
+    return {"ok": True, "data": data}
 
 
-# ---------------------------
-# DB SYNC ENDPOINTS (THE MONEY)
-# ---------------------------
+# -----------------------
+# SYNC to DB
+# -----------------------
 
 @app.post("/sync/categories")
-def sync_categories(db: Session = Depends(get_db), max: int = 200, offset: int = 0):
-    """
-    Pull categories from 4over and upsert into DB.
-    """
-    c = client()
-    out = c.get("/printproducts/categories", params={"max": max, "offset": offset})
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
+def sync_categories(db: Session = Depends(get_db), max: int = Query(50), offset: int = Query(0)):
+    code, payload = client.get("categories", params={"max": max, "offset": offset}, use_prefix=True)
+    if code >= 400:
+        return {"ok": False, "http_code": code, "data": payload}
 
-    payload = out["data"]
-    entities = payload.get("entities", [])
+    entities = payload.get("entities", []) or []
+    upserts = 0
 
-    upserted = 0
-    for e in entities:
-        cu = e.get("category_uuid")
-        if not cu:
-            continue
-
-        row = db.query(Category).filter(Category.category_uuid == cu).first()
+    for c in entities:
+        row = db.get(Category, c["category_uuid"])
         if not row:
-            row = Category(category_uuid=cu, category_name=e.get("category_name") or cu)
+            row = Category(category_uuid=c["category_uuid"])
             db.add(row)
-
-        row.category_name = e.get("category_name") or row.category_name
-        row.category_description = e.get("category_description")
-        row.products_url = e.get("products")
-
-        upserted += 1
+        row.category_name = c.get("category_name") or ""
+        row.category_description = c.get("category_description")
+        upserts += 1
 
     db.commit()
-    return {"ok": True, "upserted": upserted, "totalResults": payload.get("totalResults")}
+    return {"ok": True, "upserts": upserts, "page": payload.get("currentPage"), "totalResults": payload.get("totalResults")}
 
 
-@app.post("/sync/categories/{category_uuid}/products")
-def sync_category_products(category_uuid: str, db: Session = Depends(get_db), max: int = 200, offset: int = 0):
-    """
-    Pull products for a category and upsert.
-    """
-    c = client()
-    out = c.get(f"/printproducts/categories/{category_uuid}/products", params={"max": max, "offset": offset})
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
+@app.post("/sync/category/{category_uuid}/products")
+def sync_category_products(category_uuid: str, db: Session = Depends(get_db), max: int = Query(50), offset: int = Query(0)):
+    path = f"categories/{category_uuid}/products"
+    code, payload = client.get(path, params={"max": max, "offset": offset}, use_prefix=True)
+    if code >= 400:
+        return {"ok": False, "http_code": code, "data": payload}
 
-    payload = out["data"]
-    entities = payload.get("entities", [])
+    entities = payload.get("entities", []) or []
+    upserts = 0
+    links = 0
 
-    upserted = 0
-    for e in entities:
-        pu = e.get("product_uuid")
-        if not pu:
-            continue
+    # ensure category exists
+    if not db.get(Category, category_uuid):
+        db.add(Category(category_uuid=category_uuid, category_name="(unknown)", category_description=None))
+        db.commit()
 
-        row = db.query(Product).filter(Product.product_uuid == pu).first()
-        if not row:
-            row = Product(product_uuid=pu)
-            db.add(row)
+    for p in entities:
+        puid = p["product_uuid"]
+        prod = db.get(Product, puid)
+        if not prod:
+            prod = Product(product_uuid=puid)
+            db.add(prod)
+        prod.product_code = p.get("product_code")
+        prod.product_description = p.get("product_description")
+        upserts += 1
 
-        row.category_uuid = category_uuid
-        row.product_code = e.get("product_code")
-        row.product_description = e.get("product_description")
-        row.full_product_path = e.get("full_product_path")
-        row.option_groups_url = e.get("product_option_groups")
-        row.base_prices_url = e.get("product_base_prices")
-
-        upserted += 1
+        existing = db.query(ProductCategory).filter_by(product_uuid=puid, category_uuid=category_uuid).first()
+        if not existing:
+            db.add(ProductCategory(product_uuid=puid, category_uuid=category_uuid))
+            links += 1
 
     db.commit()
-    return {"ok": True, "category_uuid": category_uuid, "upserted": upserted, "totalResults": payload.get("totalResults")}
+    return {"ok": True, "products_upserted": upserts, "links_added": links, "page": payload.get("currentPage"), "totalResults": payload.get("totalResults")}
 
 
-@app.post("/sync/products/{product_uuid}")
+@app.post("/sync/product/{product_uuid}")
 def sync_product_detail(product_uuid: str, db: Session = Depends(get_db)):
-    """
-    Pull full product detail (includes option groups) and store it as a JSON blob.
-    This is the scalable approach: store raw payload first, normalize later.
-    """
-    c = client()
-    out = c.get(f"/printproducts/products/{product_uuid}")
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
+    code, payload = client.get(f"products/{product_uuid}", use_prefix=True)
+    if code >= 400:
+        return {"ok": False, "http_code": code, "data": payload}
 
-    data = out["data"]
-    json_text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    prod = db.get(Product, product_uuid)
+    if not prod:
+        prod = Product(product_uuid=product_uuid)
+        db.add(prod)
 
-    # upsert the product table too
-    row = db.query(Product).filter(Product.product_uuid == product_uuid).first()
-    if not row:
-        row = Product(product_uuid=product_uuid)
-        db.add(row)
+    prod.product_code = payload.get("product_code")
+    prod.product_description = payload.get("product_description")
 
-    row.product_code = data.get("product_code")
-    row.product_description = data.get("product_description")
-
-    # store blob
-    blob = db.query(PriceBlob).filter(
-        PriceBlob.product_uuid == product_uuid,
-        PriceBlob.blob_type == "product_detail",
-        PriceBlob.fingerprint == "v1",
-    ).first()
-
-    if not blob:
-        blob = PriceBlob(
-            product_uuid=product_uuid,
-            blob_type="product_detail",
-            fingerprint="v1",
-            json_text=json_text,
-        )
-        db.add(blob)
+    details = db.get(ProductDetail, product_uuid)
+    if not details:
+        details = ProductDetail(product_uuid=product_uuid, raw_json=json.dumps(payload))
+        db.add(details)
     else:
-        blob.json_text = json_text
+        details.raw_json = json.dumps(payload)
 
     db.commit()
     return {"ok": True, "product_uuid": product_uuid, "stored": True}
 
 
-@app.post("/sync/products/{product_uuid}/baseprices")
-def sync_baseprices(product_uuid: str, db: Session = Depends(get_db)):
-    """
-    Pull baseprices and store as blob. This is what pricing calculators will use first.
-    """
-    c = client()
-    out = c.get(f"/printproducts/products/{product_uuid}/baseprices")
-    if not out["ok"]:
-        raise HTTPException(status_code=out["http_code"], detail=out)
+@app.post("/sync/product/{product_uuid}/base-prices")
+def sync_product_base_prices(product_uuid: str, db: Session = Depends(get_db)):
+    max_page = 200
+    offset = 0
+    inserted = 0
+    updated = 0
 
-    data = out["data"]
-    json_text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-
-    blob = db.query(PriceBlob).filter(
-        PriceBlob.product_uuid == product_uuid,
-        PriceBlob.blob_type == "baseprices",
-        PriceBlob.fingerprint == "v1",
-    ).first()
-
-    if not blob:
-        blob = PriceBlob(
-            product_uuid=product_uuid,
-            blob_type="baseprices",
-            fingerprint="v1",
-            json_text=json_text,
+    while True:
+        code, payload = client.get(
+            f"products/{product_uuid}/baseprices",
+            params={"max": max_page, "offset": offset},
+            use_prefix=True
         )
-        db.add(blob)
-    else:
-        blob.json_text = json_text
+        if code >= 400:
+            return {"ok": False, "http_code": code, "data": payload, "offset": offset}
 
-    db.commit()
-    return {"ok": True, "product_uuid": product_uuid, "stored": True}
+        entities = payload.get("entities", []) or []
+        if not entities:
+            break
+
+        for r in entities:
+            base_price_uuid = r.get("base_price_uuid")
+            if not base_price_uuid:
+                continue
+
+            # Use base_price_uuid as primary key so inserts are idempotent
+            existing = db.get(BasePriceRow, base_price_uuid)
+            if not existing:
+                existing = BasePriceRow(
+                    id=base_price_uuid,
+                    base_price_uuid=base_price_uuid,
+                    product_uuid=product_uuid,
+                    raw_json="{}",
+                )
+                db.add(existing)
+                inserted += 1
+            else:
+                updated += 1
+
+            existing.product_baseprice = Decimal(str(r.get("product_baseprice", "0") or "0"))
+            existing.runsize_uuid = r.get("runsize_uuid")
+            existing.runsize = r.get("runsize")
+            existing.colorspec_uuid = r.get("colorspec_uuid")
+            existing.colorspec = r.get("colorspec")
+            existing.can_group_ship = r.get("can_group_ship")
+            existing.raw_json = json.dumps(r)
+
+        db.commit()
+
+        total = payload.get("totalResults")
+        offset += len(entities)
+        if total is not None and offset >= int(total):
+            break
+
+    return {"ok": True, "product_uuid": product_uuid, "inserted": inserted, "updated": updated}
 
 
-@app.get("/db/products")
-def db_products(db: Session = Depends(get_db), limit: int = 50):
-    rows = db.query(Product).order_by(Product.id.desc()).limit(limit).all()
+@app.post("/sync/doorhangers")
+def sync_doorhangers(db: Session = Depends(get_db), sample_n: int = Query(10)):
+    """
+    Door Hangers category_uuid (your known one):
+    5cacc269-e6a8-472d-91d6-792c4584cae8
+
+    This syncs all product stubs + links,
+    then syncs details + base prices for a sample subset (default 10).
+    """
+    category_uuid = "5cacc269-e6a8-472d-91d6-792c4584cae8"
+
+    max_page = 50
+    offset = 0
+    product_uuids = []
+
+    while True:
+        code, payload = client.get(
+            f"categories/{category_uuid}/products",
+            params={"max": max_page, "offset": offset},
+            use_prefix=True
+        )
+        if code >= 400:
+            return {"ok": False, "http_code": code, "data": payload, "offset": offset}
+
+        entities = payload.get("entities", []) or []
+        if not entities:
+            break
+
+        for p in entities:
+            product_uuids.append(p["product_uuid"])
+
+        # store product stubs + category link
+        sync_category_products(category_uuid, db, max=max_page, offset=offset)
+
+        total = payload.get("totalResults")
+        offset += len(entities)
+        if total is not None and offset >= int(total):
+            break
+
+    synced = []
+    for puid in product_uuids[: max(0, int(sample_n))]:
+        sync_product_detail(puid, db)
+        sync_product_base_prices(puid, db)
+        synced.append(puid)
+
     return {
         "ok": True,
-        "count": len(rows),
-        "items": [
-            {
-                "product_uuid": r.product_uuid,
-                "product_code": r.product_code,
-                "category_uuid": r.category_uuid,
-                "product_description": r.product_description,
-            }
-            for r in rows
-        ],
+        "category_uuid": category_uuid,
+        "products_found": len(product_uuids),
+        "products_synced_now": len(synced),
+        "synced_sample": synced,
     }

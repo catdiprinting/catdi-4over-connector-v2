@@ -1,92 +1,108 @@
-import hashlib
+import os
 import hmac
+import hashlib
 import requests
-from urllib.parse import urlparse, urlencode
-
-from app.config import (
-    FOUR_OVER_BASE_URL,
-    FOUR_OVER_API_PREFIX,
-    FOUR_OVER_TIMEOUT,
-    FOUR_OVER_APIKEY,
-    FOUR_OVER_PRIVATE_KEY,
-)
+from urllib.parse import urlencode
 
 
 class FourOverClient:
     """
-    4over authentication:
-    signature = HMAC_SHA256(
-        message = HTTP_METHOD,
-        key     = SHA256(PRIVATE_KEY)
-    )
-
-    GET requests use query params: apikey + signature
+    4over auth notes (based on your working debug/auth output):
+      - GET uses query auth: ?apikey=XXX&signature=YYY
+      - POST uses header: Authorization: API apikey:signature
+    Signature is HMAC-SHA256(private_key, canonical_string)
+    canonical_string example from your debug:
+      "/whoami?apikey=catdi"
     """
 
     def __init__(self):
-        if not FOUR_OVER_APIKEY:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY")
-        if not FOUR_OVER_PRIVATE_KEY:
-            raise RuntimeError("Missing FOUR_OVER_PRIVATE_KEY")
+        self.base_url = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
+        self.api_prefix = os.getenv("FOUR_OVER_API_PREFIX", "printproducts").strip("/")
 
-        self.base_url = FOUR_OVER_BASE_URL.rstrip("/")
-        self.prefix = FOUR_OVER_API_PREFIX.strip("/")
-        self.apikey = FOUR_OVER_APIKEY.strip()
-        self.private_key = FOUR_OVER_PRIVATE_KEY.strip()
-        self.timeout = int(FOUR_OVER_TIMEOUT)
+        self.apikey = os.getenv("FOUR_OVER_APIKEY", "")
+        self.private_key = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
 
-    def _signature(self, method: str) -> str:
-        key = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
+        # Keep it string for debug readability; convert to int when used
+        self.timeout = os.getenv("FOUR_OVER_TIMEOUT", "30")
+
+        if not self.apikey or not self.private_key:
+            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
+
+    def _hmac_sha256(self, message: str) -> str:
         return hmac.new(
-            key.encode("utf-8"),
-            method.upper().encode("utf-8"),
+            self.private_key.encode("utf-8"),
+            message.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
-    def _path(self, path: str) -> str:
-        if not path.startswith("/"):
-            path = "/" + path
-
-        # whoami lives at root
-        if path == "/whoami":
+    def _canonical(self, path: str, params: dict | None = None) -> str:
+        """
+        Canonical form is path + ? + sorted query (if any).
+        Example: "/whoami?apikey=catdi"
+        """
+        if not params:
             return path
+        # sort params for stable signing
+        items = sorted((k, str(v)) for k, v in params.items() if v is not None)
+        return f"{path}?{urlencode(items)}"
 
-        if self.prefix and not path.startswith(f"/{self.prefix}/"):
-            return f"/{self.prefix}{path}"
+    def _url(self, path: str) -> str:
+        # If path is already a full URL from 4over, use it.
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        # Otherwise assume it's an API path
+        return f"{self.base_url}/{path.lstrip('/')}"
 
-        return path
-
-    def get(self, path: str, params: dict | None = None):
-        sig = self._signature("GET")
-        url = f"{self.base_url}{self._path(path)}"
-
-        qp = {"apikey": self.apikey, "signature": sig}
-        if params:
-            for k, v in params.items():
-                if v is not None:
-                    qp[k] = v
-
-        return requests.get(url, params=qp, timeout=self.timeout)
-
-    def get_url(self, full_url: str, params: dict | None = None):
+    def get(self, path: str, params: dict | None = None) -> requests.Response:
         """
-        Used for option_prices URLs returned by 4over
+        GET uses query auth: apikey + signature.
+        The signature is computed from canonical = path + ? + query(apikey + other params)
         """
-        sig = self._signature("GET")
+        params = dict(params or {})
+        params["apikey"] = self.apikey
 
-        qp = {"apikey": self.apikey, "signature": sig}
-        if params:
-            for k, v in params.items():
-                if v is not None:
-                    qp[k] = v
+        # Determine the signing path:
+        # If path is full url, extract the pathname part for canonical signing
+        signing_path = path
+        if signing_path.startswith("http://") or signing_path.startswith("https://"):
+            # Convert full URL to just the path part for canonical signing
+            # Example: https://api.4over.com/printproducts/categories -> /printproducts/categories
+            signing_path = "/" + signing_path.split("://", 1)[1].split("/", 1)[1]
+            signing_path = "/" + signing_path.split("/", 1)[1] if not signing_path.startswith("/") else signing_path
 
-        parsed = urlparse(full_url)
-        existing = parsed.query
-        extra = urlencode(qp)
+        # If caller passes /printproducts/... directly, keep it
+        if not signing_path.startswith("/"):
+            signing_path = "/" + signing_path
 
-        if existing:
-            url = full_url + "&" + extra
-        else:
-            url = full_url + "?" + extra
+        canonical = self._canonical(signing_path, params)
+        signature = self._hmac_sha256(canonical)
+        params["signature"] = signature
 
-        return requests.get(url, timeout=self.timeout)
+        url = self._url(path)
+        return requests.get(url, params=params, timeout=int(self.timeout))
+
+    def post(self, path: str, json_body: dict | None = None, params: dict | None = None) -> requests.Response:
+        """
+        POST uses Authorization header:
+          Authorization: API apikey:signature
+        Signature computed from canonical = path (+ ?query if params)
+        """
+        params = dict(params or {})
+
+        signing_path = path
+        if signing_path.startswith("http://") or signing_path.startswith("https://"):
+            signing_path = "/" + signing_path.split("://", 1)[1].split("/", 1)[1]
+            signing_path = "/" + signing_path.split("/", 1)[1] if not signing_path.startswith("/") else signing_path
+
+        if not signing_path.startswith("/"):
+            signing_path = "/" + signing_path
+
+        canonical = self._canonical(signing_path, params if params else None)
+        signature = self._hmac_sha256(canonical)
+
+        headers = {
+            "Authorization": f"API {self.apikey}:{signature}",
+            "Content-Type": "application/json",
+        }
+
+        url =

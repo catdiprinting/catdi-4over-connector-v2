@@ -1,18 +1,23 @@
-# app/db.py
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
-from .config import DATABASE_URL
+import os
 
-db_url = DATABASE_URL or "sqlite:///./local.db"
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Railway Postgres sometimes uses postgres:// which SQLAlchemy wants as postgresql://
-if db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 
-connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
+# Railway Postgres URLs sometimes start with postgres:// which SQLAlchemy wants as postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(db_url, connect_args=connect_args, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
 Base = declarative_base()
 
@@ -23,3 +28,8 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def db_ping(db) -> None:
+    # SQLAlchemy 2.x requires textual SQL to be wrapped with text()
+    db.execute(text("SELECT 1"))

@@ -1,14 +1,12 @@
-# app/config.py
 import os
 
+# 4over
+FOUR_OVER_BASE_URL = os.getenv("FOUR_OVER_BASE_URL", "https://api.4over.com").rstrip("/")
+# Prefix for catalog endpoints (NOT for /whoami)
+FOUR_OVER_API_PREFIX = os.getenv("FOUR_OVER_API_PREFIX", "printproducts").strip("/")
+FOUR_OVER_APIKEY = os.getenv("FOUR_OVER_APIKEY", "")
+FOUR_OVER_PRIVATE_KEY = os.getenv("FOUR_OVER_PRIVATE_KEY", "")
+FOUR_OVER_TIMEOUT = int(os.getenv("FOUR_OVER_TIMEOUT", "30"))
 
-def env(key: str, default: str | None = None) -> str | None:
-    val = os.getenv(key)
-    return val if val is not None and val != "" else default
-
-
-FOUR_OVER_BASE_URL = env("FOUR_OVER_BASE_URL", "https://api.4over.com")
-FOUR_OVER_APIKEY = env("FOUR_OVER_APIKEY")
-FOUR_OVER_PRIVATE_KEY = env("FOUR_OVER_PRIVATE_KEY")
-
-DATABASE_URL = env("DATABASE_URL", "sqlite:///./local.db")
+# DB
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")

@@ -20,16 +20,25 @@ def db_ping():
 
 @app.get("/4over/whoami")
 def whoami():
-    # ROOT endpoint: no /printproducts prefix
-    resp = client.get("/whoami", use_prefix=False)
+    try:
+        # ROOT endpoint: NO /printproducts prefix
+        resp = client.get("/whoami", use_prefix=False)
+    except Exception as e:
+        # Don't crash the app — show the real env/auth error
+        raise HTTPException(status_code=500, detail=str(e))
+
     if not resp["ok"]:
         raise HTTPException(status_code=resp["http_code"], detail=resp["data"])
     return resp["data"]
 
 @app.get("/4over/categories")
 def categories():
-    # Catalog endpoint: USE /printproducts prefix
-    resp = client.get("/categories", use_prefix=True)
+    try:
+        # Catalog endpoint: USE /printproducts prefix
+        resp = client.get("/categories", use_prefix=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     if not resp["ok"]:
         raise HTTPException(status_code=resp["http_code"], detail=resp["data"])
     return resp["data"]

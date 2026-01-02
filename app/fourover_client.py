@@ -1,8 +1,9 @@
 import hashlib
 import hmac
 import time
-import requests
 from urllib.parse import urlencode
+
+import requests
 
 from app.config import (
     FOUR_OVER_BASE_URL,
@@ -15,63 +16,82 @@ from app.config import (
 
 class FourOverClient:
     """
-    Signs requests like:
-      GET /whoami?apikey=XXXX&signature=YYYY
-    signature = HMAC-SHA256(private_key, canonical_path_with_query_without_signature)
+    Builds signed requests like:
+      BASE_URL + /{prefix}/{path}?apikey=...&signature=...
+
+    IMPORTANT:
+    - Some endpoints (like /whoami) are NOT under the prefix.
+    - So we support use_prefix=False for those.
     """
 
     def __init__(self):
-        if not FOUR_OVER_APIKEY:
-            raise RuntimeError("Missing FOUR_OVER_APIKEY")
-        if not FOUR_OVER_PRIVATE_KEY:
-            raise RuntimeError("Missing FOUR_OVER_PRIVATE_KEY")
+        if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
+            # don’t crash import; raise only when used
+            self.ready = False
+        else:
+            self.ready = True
 
         self.base = FOUR_OVER_BASE_URL
-        self.prefix = ("/" + FOUR_OVER_API_PREFIX.strip("/")) if FOUR_OVER_API_PREFIX else ""
-        self.timeout = FOUR_OVER_TIMEOUT
+        self.prefix = FOUR_OVER_API_PREFIX.strip("/")
 
-    def _sign(self, canonical: str) -> str:
-        # canonical must start with "/"
-        digest = hmac.new(
-            FOUR_OVER_PRIVATE_KEY.encode("utf-8"),
-            canonical.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return digest
+    def _signature(self, canonical: str) -> str:
+        # 4over expects HMAC-SHA256 of canonical using the private key
+        key = FOUR_OVER_PRIVATE_KEY.encode("utf-8")
+        msg = canonical.encode("utf-8")
+        return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
-    def _build_url(self, path: str, params: dict | None = None) -> str:
-        if not path.startswith("/"):
-            path = "/" + path
+    def _build_url(self, path: str, params: dict | None = None, use_prefix: bool = True) -> tuple[str, str]:
+        """
+        Returns (url, canonical_path_with_query)
+        canonical is what gets signed (path + querystring excluding signature)
+        """
 
-        full_path = f"{self.prefix}{path}"
+        if not self.ready:
+            raise RuntimeError("Missing FOUR_OVER_APIKEY or FOUR_OVER_PRIVATE_KEY")
 
-        q = params.copy() if params else {}
-        q["apikey"] = FOUR_OVER_APIKEY
+        params = dict(params or {})
 
-        # signature is computed WITHOUT signature itself
-        canonical = full_path
-        if q:
-            canonical = canonical + "?" + urlencode(q)
+        # Always include apikey in signed query
+        params["apikey"] = FOUR_OVER_APIKEY
 
-        sig = self._sign(canonical)
-        q["signature"] = sig
+        # Clean path
+        path = path.strip("/")
+        full_path = path
 
-        return f"{self.base}{full_path}?{urlencode(q)}"
+        if use_prefix:
+            # Avoid prefix duplication defensively
+            if full_path.startswith(self.prefix + "/"):
+                pass
+            else:
+                full_path = f"{self.prefix}/{full_path}"
 
-    def get(self, path: str, params: dict | None = None) -> dict:
-        url = self._build_url(path, params=params)
-        r = requests.get(url, timeout=self.timeout)
+        canonical = "/" + full_path
+        qs = urlencode(params)
+        canonical_with_qs = canonical + ("?" + qs if qs else "")
+
+        sig = self._signature(canonical_with_qs)
+        url = f"{self.base}{canonical_with_qs}&signature={sig}"
+
+        return url, canonical_with_qs
+
+    def get(self, path: str, params: dict | None = None, use_prefix: bool = True):
+        url, _canonical = self._build_url(path, params=params, use_prefix=use_prefix)
         try:
-            payload = r.json()
-        except Exception:
-            payload = {"raw": r.text}
+            r = requests.get(url, timeout=FOUR_OVER_TIMEOUT)
+            content_type = r.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return r.status_code, r.json()
+            return r.status_code, {"raw": r.text}
+        except Exception as e:
+            return 599, {"status": "error", "message": str(e), "url": url}
 
-        if r.status_code >= 400:
-            return {
-                "ok": False,
-                "http_code": r.status_code,
-                "url": url,
-                "response": payload,
-            }
-
-        return {"ok": True, "url": url, "data": payload}
+    def post(self, path: str, json_body: dict | None = None, params: dict | None = None, use_prefix: bool = True):
+        url, _canonical = self._build_url(path, params=params, use_prefix=use_prefix)
+        try:
+            r = requests.post(url, json=json_body or {}, timeout=FOUR_OVER_TIMEOUT)
+            content_type = r.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return r.status_code, r.json()
+            return r.status_code, {"raw": r.text}
+        except Exception as e:
+            return 599, {"status": "error", "message": str(e), "url": url}

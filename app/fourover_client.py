@@ -1,26 +1,26 @@
-ytimport hashlib
+import hashlib
 import hmac
 import requests
 from urllib.parse import urlparse, urlencode
 
-from app.config import (yuyuyuy
+from app.config import (
     FOUR_OVER_BASE_URL,
     FOUR_OVER_API_PREFIX,
-    FOUR_OVER_TIMEOUT,uytutyuytuytu
+    FOUR_OVER_TIMEOUT,
     FOUR_OVER_APIKEY,
     FOUR_OVER_PRIVATE_KEY,
-)yuiyuiuy
-lk;lk;kl;kl;kl;
+)
+
 
 class FourOverClient:
     """
-    4over AUTH:
-      signature = HMAC_SHA256(
+    4over authentication:
+    signature = HMAC_SHA256(
         message = HTTP_METHOD,
         key     = SHA256(PRIVATE_KEY)
-      )
+    )
 
-    For GET requests, we send apikey + signature via querystring.
+    GET requests use query params: apikey + signature
     """
 
     def __init__(self):
@@ -37,13 +37,17 @@ class FourOverClient:
 
     def _signature(self, method: str) -> str:
         key = hashlib.sha256(self.private_key.encode("utf-8")).hexdigest()
-        return hmac.new(key.encode("utf-8"), method.upper().encode("utf-8"), hashlib.sha256).hexdigest()
+        return hmac.new(
+            key.encode("utf-8"),
+            method.upper().encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
     def _path(self, path: str) -> str:
         if not path.startswith("/"):
             path = "/" + path
 
-        # whoami always root
+        # whoami lives at root
         if path == "/whoami":
             return path
 
@@ -66,8 +70,7 @@ class FourOverClient:
 
     def get_url(self, full_url: str, params: dict | None = None):
         """
-        Fetch a FULL URL returned by 4over (e.g. option_prices links).
-        We append apikey/signature to that URL.
+        Used for option_prices URLs returned by 4over
         """
         sig = self._signature("GET")
 
@@ -77,7 +80,6 @@ class FourOverClient:
                 if v is not None:
                     qp[k] = v
 
-        # preserve existing query params if present
         parsed = urlparse(full_url)
         existing = parsed.query
         extra = urlencode(qp)

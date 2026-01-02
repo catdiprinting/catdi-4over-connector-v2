@@ -1,85 +1,104 @@
-# app/fourover_client.py
-import hmac
 import hashlib
+import hmac
+from urllib.parse import urlencode, urlparse, parse_qsl
+
 import requests
-from urllib.parse import urlencode, quote
+
+from .config import (
+    FOUR_OVER_BASE_URL,
+    FOUR_OVER_API_PREFIX,
+    FOUR_OVER_APIKEY,
+    FOUR_OVER_PRIVATE_KEY,
+    FOUR_OVER_TIMEOUT,
+)
 
 
 class FourOverClient:
     """
-    Builds a *fully-signed URL* so the canonical string used for HMAC
-    matches the exact query string sent over the wire.
+    Thin 4over REST client.
+
+    Key points:
+    - /whoami is NOT under /printproducts
+    - Signature = HMAC-SHA256(private_key, canonical_path_with_query_without_signature)
+    - Avoid double-prefixing /printproducts/printproducts/...
     """
 
-    def __init__(self, base_url: str, apikey: str, private_key: str, timeout: int = 30):
-        self.base_url = (base_url or "").rstrip("/")
-        self.apikey = (apikey or "").strip()
-        # IMPORTANT: strip whitespace/newlines from copied secrets
-        self.private_key = (private_key or "").strip()
-        self.timeout = timeout
+    def __init__(self):
+        if not FOUR_OVER_APIKEY or not FOUR_OVER_PRIVATE_KEY:
+            # Don't crash import; endpoints will show missing in /debug/auth
+            pass
+        self.base = FOUR_OVER_BASE_URL.rstrip("/")
+        self.prefix = FOUR_OVER_API_PREFIX.strip("/")
 
-    def _sign(self, canonical: str) -> str:
+    def _should_prefix(self, path: str) -> bool:
+        # whoami is root endpoint
+        if path.startswith("/whoami"):
+            return False
+        # already prefixed
+        if self.prefix and path.startswith(f"/{self.prefix}/"):
+            return False
+        return bool(self.prefix)
+
+    def _with_prefix(self, path: str) -> str:
+        if self._should_prefix(path):
+            return f"/{self.prefix}{path}"
+        return path
+
+    def _canonical(self, path: str, params: dict) -> str:
+        # canonical includes apikey and ANY other params (sorted), but NOT signature
+        canonical_params = dict(params or {})
+        canonical_params["apikey"] = FOUR_OVER_APIKEY
+
+        # sort params for stable canonical
+        qs = urlencode(sorted(canonical_params.items()))
+        return f"{path}?{qs}"
+
+    def _signature(self, canonical: str) -> str:
         return hmac.new(
-            self.private_key.encode("utf-8"),
+            FOUR_OVER_PRIVATE_KEY.encode("utf-8"),
             canonical.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
 
-    def _normalize_path(self, path: str) -> str:
-        if not path.startswith("/"):
-            path = "/" + path
-        return path
+    def _build_url(self, path: str, params: dict | None = None) -> str:
+        # prefix only for catalog endpoints
+        path = self._with_prefix(path)
 
-    def _encode_qs(self, params: dict) -> str:
-        """
-        Use deterministic encoding:
-        - sort by key
-        - percent-encode consistently (not plus-space weirdness)
-        """
-        items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
-        # quote() makes spaces %20 instead of +
-        return urlencode(items, quote_via=quote, safe="")
+        canonical = self._canonical(path, params or {})
+        sig = self._signature(canonical)
 
-    def signed_url(self, path: str, params: dict | None = None) -> tuple[str, str]:
-        """
-        Returns (full_url, canonical_string_used_for_signature)
-        """
-        path = self._normalize_path(path)
-        params = dict(params or {})
-        params["apikey"] = self.apikey
+        final_params = dict(params or {})
+        final_params["apikey"] = FOUR_OVER_APIKEY
+        final_params["signature"] = sig
 
-        qs = self._encode_qs(params)
-        canonical = f"{path}?{qs}" if qs else path
+        return f"{self.base}{path}?{urlencode(final_params)}"
 
-        sig = self._sign(canonical)
+    def get(self, path: str, params: dict | None = None):
+        url = self._build_url(path, params)
+        r = requests.get(url, timeout=FOUR_OVER_TIMEOUT)
+        ct = r.headers.get("content-type", "")
+        data = r.json() if "application/json" in ct else r.text
+        return {"ok": r.ok, "http_code": r.status_code, "url": url, "data": data}
 
-        # append signature as LAST param (keeps canonical clean & predictable)
-        full_qs = qs + ("&" if qs else "") + f"signature={sig}"
-        url = f"{self.base_url}{path}?{full_qs}"
+    def get_by_full_url(self, full_url: str):
+        # If 4over returns full URLs (already prefixed), use them as-is.
+        parsed = urlparse(full_url)
+        path = parsed.path
+        params = dict(parse_qsl(parsed.query))
 
-        return url, canonical
+        # remove signature if present
+        params.pop("signature", None)
+        params.pop("apikey", None)
 
-    def get(self, path: str, params: dict | None = None) -> dict:
-        url, canonical = self.signed_url(path, params)
+        # build signature for the path + params (and apikey added in _canonical)
+        canonical = self._canonical(path, params)
+        sig = self._signature(canonical)
 
-        r = requests.get(url, timeout=self.timeout)
-        try:
-            data = r.json()
-        except Exception:
-            return {
-                "status": "error",
-                "http_code": r.status_code,
-                "text": r.text,
-                "debug": {"url": url, "canonical": canonical},
-            }
+        params["apikey"] = FOUR_OVER_APIKEY
+        params["signature"] = sig
 
-        # Always attach debug when not 200
-        if r.status_code >= 400:
-            return {
-                "status": "error",
-                "http_code": r.status_code,
-                "response": data,
-                "debug": {"url": url, "canonical": canonical},
-            }
-
-        return data
+        url = f"{self.base}{path}?{urlencode(params)}"
+        r = requests.get(url, timeout=FOUR_OVER_TIMEOUT)
+        ct = r.headers.get("content-type", "")
+        data = r.json() if "application/json" in ct else r.text
+        return {"ok": r.ok, "http_code": r.status_code, "url": url, "data": data}

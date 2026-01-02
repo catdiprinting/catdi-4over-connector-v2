@@ -1,54 +1,85 @@
 # app/fourover_client.py
 import hmac
 import hashlib
-from urllib.parse import urlencode
 import requests
+from urllib.parse import urlencode, quote
 
 
 class FourOverClient:
     """
-    4over auth pattern you were using:
-      - GET uses query auth: ?apikey=XXX&signature=YYY
-      - Signature is HMAC-SHA256(private_key, canonical_string)
-      - canonical_string example: "/whoami?apikey=catdi"
+    Builds a *fully-signed URL* so the canonical string used for HMAC
+    matches the exact query string sent over the wire.
     """
 
     def __init__(self, base_url: str, apikey: str, private_key: str, timeout: int = 30):
-        self.base_url = base_url.rstrip("/")
-        self.apikey = apikey
-        self.private_key = private_key
+        self.base_url = (base_url or "").rstrip("/")
+        self.apikey = (apikey or "").strip()
+        # IMPORTANT: strip whitespace/newlines from copied secrets
+        self.private_key = (private_key or "").strip()
         self.timeout = timeout
 
-    def _canonical(self, path: str, params: dict | None = None) -> str:
-        if not params:
-            return path
-        items = sorted((k, str(v)) for k, v in params.items() if v is not None)
-        return f"{path}?{urlencode(items)}"
-
     def _sign(self, canonical: str) -> str:
-        digest = hmac.new(
+        return hmac.new(
             self.private_key.encode("utf-8"),
             canonical.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
-        return digest
 
-    def _url(self, path_or_url: str) -> str:
-        if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
-            return path_or_url
-        return f"{self.base_url}/{path_or_url.lstrip('/')}"
+    def _normalize_path(self, path: str) -> str:
+        if not path.startswith("/"):
+            path = "/" + path
+        return path
 
-    def get(self, path: str, params: dict | None = None) -> dict:
+    def _encode_qs(self, params: dict) -> str:
+        """
+        Use deterministic encoding:
+        - sort by key
+        - percent-encode consistently (not plus-space weirdness)
+        """
+        items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
+        # quote() makes spaces %20 instead of +
+        return urlencode(items, quote_via=quote, safe="")
+
+    def signed_url(self, path: str, params: dict | None = None) -> tuple[str, str]:
+        """
+        Returns (full_url, canonical_string_used_for_signature)
+        """
+        path = self._normalize_path(path)
         params = dict(params or {})
         params["apikey"] = self.apikey
 
-        canonical = self._canonical(path if path.startswith("/") else f"/{path}", params)
-        sig = self._sign(canonical)
-        params["signature"] = sig
+        qs = self._encode_qs(params)
+        canonical = f"{path}?{qs}" if qs else path
 
-        url = self._url(path)
-        r = requests.get(url, params=params, timeout=self.timeout)
+        sig = self._sign(canonical)
+
+        # append signature as LAST param (keeps canonical clean & predictable)
+        full_qs = qs + ("&" if qs else "") + f"signature={sig}"
+        url = f"{self.base_url}{path}?{full_qs}"
+
+        return url, canonical
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        url, canonical = self.signed_url(path, params)
+
+        r = requests.get(url, timeout=self.timeout)
         try:
-            return r.json()
+            data = r.json()
         except Exception:
-            return {"status": "error", "http_code": r.status_code, "text": r.text}
+            return {
+                "status": "error",
+                "http_code": r.status_code,
+                "text": r.text,
+                "debug": {"url": url, "canonical": canonical},
+            }
+
+        # Always attach debug when not 200
+        if r.status_code >= 400:
+            return {
+                "status": "error",
+                "http_code": r.status_code,
+                "response": data,
+                "debug": {"url": url, "canonical": canonical},
+            }
+
+        return data

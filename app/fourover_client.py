@@ -4,7 +4,6 @@ import requests
 
 from .config import (
     FOUR_OVER_BASE_URL,
-    FOUR_OVER_API_PREFIX,
     FOUR_OVER_APIKEY,
     FOUR_OVER_PRIVATE_KEY,
     FOUR_OVER_TIMEOUT,
@@ -13,17 +12,14 @@ from .config import (
 
 class FourOverClient:
     """
-    Canonical 4over client.
-    - NO canonical URL signing
-    - Signature = HMAC_SHA256(HTTP_METHOD, SHA256(private_key))
-    - GET requests pass apikey + signature as query params
+    Correct 4over client.
+    Signature = HMAC_SHA256(HTTP_METHOD, SHA256(private_key))
+    GET requests send apikey + signature as query params.
     """
 
     def __init__(self):
-        self.base = FOUR_OVER_BASE_URL.rstrip("/")
-        self.prefix = FOUR_OVER_API_PREFIX.strip("/")
+        self.base = FOUR_OVER_BASE_URL
 
-        # Per 4over docs: HMAC key is SHA256(private_key)
         self._hmac_key = hashlib.sha256(
             FOUR_OVER_PRIVATE_KEY.encode("utf-8")
         ).digest()
@@ -35,9 +31,6 @@ class FourOverClient:
         })
 
     def _signature(self, method: str) -> str:
-        """
-        signature = HMAC_SHA256(HTTP_METHOD, SHA256(private_key))
-        """
         return hmac.new(
             self._hmac_key,
             method.upper().encode("utf-8"),
@@ -45,14 +38,6 @@ class FourOverClient:
         ).hexdigest()
 
     def get(self, path: str, params: dict | None = None):
-        """
-        Perform a GET request against 4over.
-
-        Example paths:
-          /whoami
-          /printproducts/categories
-        """
-
         if not path.startswith("/"):
             path = "/" + path
 
@@ -83,5 +68,4 @@ class FourOverClient:
         }
 
 
-# Singleton (matches existing usage pattern)
 client = FourOverClient()

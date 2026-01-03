@@ -38,8 +38,10 @@ def test_connection():
         return jsonify({"status": "Success", "data": response.json()})
     else:
         return jsonify({"status": "Failed", "error": response.text}), 401
-
 if __name__ == "__main__":
-    # Railway automatically assigns a PORT
-    port = int(os.environ.get("PORT", 8000))
+    # Railway provides the PORT environment variable automatically. 
+    # Do NOT set this to a hardcoded number like 8000.
+    port = int(os.environ.get("PORT", 8080)) 
+    
+    # You MUST use host='0.0.0.0' for Railway to route traffic to your app
     app.run(host='0.0.0.0', port=port)

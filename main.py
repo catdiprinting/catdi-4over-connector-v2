@@ -31,12 +31,12 @@ def home():
         except: safe_url = "Error Parsing"
             
     return f"""
-    <h1>Connector Status: Online</h1>
-    <p><strong>Connected To:</strong> {safe_url}</p>
+    <h1>4over Connector (Docs Aligned)</h1>
+    <p><strong>DB:</strong> {safe_url}</p>
     <hr>
-    <p>1. <a href="/reset-db">Reset Database</a> (Clean Slate)</p>
-    <p>2. <a href="/sync-categories">Sync Categories</a> (The Page Flipper)</p>
-    <p>3. <a href="/sync-postcards-full">Sync Postcards</a> (Deep Data)</p>
+    <p>1. <a href="/reset-db">Reset Database</a></p>
+    <p>2. <a href="/sync-categories">Sync Categories</a> (Loops all Pages)</p>
+    <p>3. <a href="/sync-postcards-full">Sync Postcards</a></p>
     """
 
 @app.route('/reset-db')
@@ -51,84 +51,77 @@ def reset_db():
         return "DATABASE RESET COMPLETE."
     except Exception as e: return f"Error: {str(e)}"
 
+# --- STEP 2: CATEGORY SYNC (UPDATED PER DOCS) ---
 @app.route('/sync-categories')
 def sync_categories():
     def generate():
-        yield "Starting 'Page Flipper' Sync...\n"
+        yield "Starting Category Sync (Pagination Mode)...\n"
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 1. Ensure Tables Exist
+        # 1. Setup Tables
         cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
         cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
         cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
         conn.commit()
 
-        # 2. THE LOOP
-        # We will loop 25 times. 25 pages * 20 items = 500 items. 
-        # This covers the whole DB.
+        # 2. Get Page 1 to determine Max Pages
+        page = 1
+        max_pages = 1 # Default, will update from API
         
-        found_target = False
-        total_saved = 0
-        
-        for page in range(1, 26): # Loop pages 1 to 25
+        while page <= max_pages:
             try:
                 sig = generate_signature("GET")
-                # We ask for 50, but we expect 20.
+                # Docs say limit is capped at 20, but we request 50 just in case
                 params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 50}
                 
-                yield f"Flipping to Page {page}...\n"
+                yield f"Requesting Page {page}...\n"
                 resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
-                
-                if resp.status_code != 200:
-                    yield f"Error on Page {page}: {resp.status_code}\n"
-                    break
-
                 data = resp.json()
-                entities = data.get('entities', [])
                 
+                # UPDATE MAX PAGES from the API response (The "Docs" logic)
+                if 'maximumPages' in data:
+                    max_pages = int(data['maximumPages'])
+                    # Safety Cap in case API goes crazy
+                    if max_pages > 50: max_pages = 50 
+                
+                entities = data.get('entities', [])
                 if not entities:
-                    yield "Page is empty. Reached the end.\n"
+                    yield "Page empty. Stopping.\n"
                     break
                 
-                # Save this batch
                 for cat in entities:
-                    c_name = cat['category_name']
-                    if "Postcards" in c_name:
-                        yield f"*** FOUND POSTCARDS: {c_name} (Page {page}) ***\n"
-                        found_target = True
+                    if "Postcards" in cat['category_name']:
+                        yield f"*** FOUND POSTCARDS: {cat['category_name']} ***\n"
                     
                     cur.execute("""
                         INSERT INTO product_categories (category_uuid, category_name) 
                         VALUES (%s, %s) ON CONFLICT (category_uuid) DO NOTHING
-                    """, (cat['category_uuid'], c_name))
+                    """, (cat['category_uuid'], cat['category_name']))
                 
                 conn.commit()
-                total_saved += len(entities)
-                yield f"--> Saved {len(entities)} items (Total: {total_saved})\n"
-                time.sleep(0.2) # Be nice to the API
+                yield f"--> Saved {len(entities)} categories. (Max Pages: {max_pages})\n"
+                
+                page += 1
+                time.sleep(0.2) # Respect rate limits
                 
             except Exception as e:
-                yield f"Loop Error: {str(e)}\n"
+                yield f"ERROR on Page {page}: {str(e)}\n"
                 break
-        
+
         cur.close(); conn.close()
-        
-        if found_target:
-            yield "\nSUCCESS: 'Postcards' was found and saved.\n"
-        else:
-            yield "\nWARNING: Finished 25 pages but 'Postcards' was NOT found.\n"
-            
-        yield "Sync Complete.\n"
+        yield "Category Sync Finished.\n"
 
     return Response(stream_with_context(generate()), mimetype='text/plain')
 
+# --- STEP 3: POSTCARDS SYNC ---
 @app.route('/sync-postcards-full')
 def sync_postcards_full():
     def generate():
         conn = get_db_connection()
         cur = conn.cursor()
         
+        # 1. Find the UUID we just saved
         yield "Searching DB for 'Postcards'...\n"
         cur.execute("SELECT category_name, category_uuid FROM product_categories WHERE category_name ILIKE '%Postcards%';")
         rows = cur.fetchall()
@@ -137,38 +130,40 @@ def sync_postcards_full():
             yield "ERROR: Postcards UUID not found in DB. Did the category sync finish?\n"
             return
             
-        # Sort to find the simplest name "Postcards" vs "Postcards - EDDM"
+        # Sort to find the simplest name "Postcards" (Shortest string)
         best_match = sorted(rows, key=lambda x: len(x[0]))[0]
         cat_uuid = best_match[1]
-        cat_name = best_match[0]
-        yield f"Locked on: {cat_name} ({cat_uuid})\n"
+        yield f"Selected Category: {best_match[0]} ({cat_uuid})\n"
 
-        # --- PRODUCT SYNC ---
+        # 2. Fetch Products for this Category
+        # We also need to paginate this, as per the "Products Feed" docs you pasted
         page = 1
-        products_found = 0
+        max_pages = 1
         
-        # Loop to get ALL postcard products (usually multiple pages)
-        for page in range(1, 10):
+        while page <= max_pages:
             sig = generate_signature("GET")
-            params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 200}
+            params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 50}
             
-            yield f"Fetching Postcards Page {page}...\n"
+            yield f"Fetching Products Page {page}...\n"
             resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_uuid}/products", params=params)
             data = resp.json()
-            products = data.get('entities', [])
             
+            if 'maximumPages' in data:
+                max_pages = int(data['maximumPages'])
+                if max_pages > 20: max_pages = 20 # Safety cap
+                
+            products = data.get('entities', [])
             if not products: break
             
             for prod in products:
-                p_uuid, p_name = prod['product_uuid'], prod['product_name']
-                cur.execute("INSERT INTO products (product_uuid, category_uuid, product_name) VALUES (%s, %s, %s) ON CONFLICT (product_uuid) DO NOTHING", (p_uuid, cat_uuid, p_name))
+                cur.execute("INSERT INTO products (product_uuid, category_uuid, product_name) VALUES (%s, %s, %s) ON CONFLICT (product_uuid) DO NOTHING", 
+                            (prod['product_uuid'], cat_uuid, prod['product_name']))
             
             conn.commit()
-            products_found += len(products)
-            yield f"--> Saved {len(products)} postcards.\n"
+            yield f"--> Saved {len(products)} products.\n"
+            page += 1
             time.sleep(0.2)
 
-        yield f"Total Postcards Saved: {products_found}.\n"
         yield "Job Done.\n"
 
     return Response(stream_with_context(generate()), mimetype='text/plain')

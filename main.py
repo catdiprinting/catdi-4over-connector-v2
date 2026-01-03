@@ -4,7 +4,6 @@ from flask import Flask, Response, stream_with_context
 app = Flask(__name__)
 
 # --- CONFIG ---
-# Automatically fix Railway's "postgres://" vs "postgresql://" quirk
 raw_db_url = os.environ.get('DATABASE_URL', '')
 if raw_db_url.startswith("postgres://"):
     DB_URL = raw_db_url.replace("postgres://", "postgresql://", 1)
@@ -24,31 +23,22 @@ def get_db_connection():
 
 @app.route('/')
 def home():
-    # --- DEBUG SECTION ---
-    # This safely shows us what the app sees, without revealing the password
     safe_url = "Not Set"
     if DB_URL:
         try:
-            # parsing to hide password
             parts = DB_URL.split("@")
-            if len(parts) > 1:
-                safe_url = f"...@{parts[1]}" # Shows only host:port/db
-            else:
-                safe_url = "Invalid Format"
-        except:
-            safe_url = "Error Parsing"
+            safe_url = f"...@{parts[1]}" if len(parts) > 1 else "Invalid Format"
+        except: safe_url = "Error Parsing"
             
     return f"""
     <h1>Connector Status: Online</h1>
-    <p><strong>Target Database:</strong> {safe_url}</p>
-    <p><strong>Target API:</strong> {BASE_URL}</p>
+    <p><strong>Connected To:</strong> {safe_url}</p>
     <hr>
-    <p>1. <a href="/reset-db">Reset Database</a> (Wipes tables)</p>
-    <p>2. <a href="/sync-categories">Sync Categories</a> (Rebuilds tables)</p>
-    <p>3. <a href="/sync-postcards-full">Sync Postcards</a> (Deep dive)</p>
+    <p>1. <a href="/reset-db">Reset Database</a> (Clean Slate)</p>
+    <p>2. <a href="/sync-categories">Sync ALL Categories</a> (Limit 500)</p>
+    <p>3. <a href="/sync-postcards-full">Sync Postcards</a> (Deep Data)</p>
     """
 
-# --- STEP 1: RESET DB ---
 @app.route('/reset-db')
 def reset_db():
     try:
@@ -57,143 +47,111 @@ def reset_db():
         cur.execute("DROP TABLE IF EXISTS product_attributes CASCADE;")
         cur.execute("DROP TABLE IF EXISTS products CASCADE;")
         cur.execute("DROP TABLE IF EXISTS product_categories CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS product_configurations CASCADE;") # Ghost 1
-        cur.execute("DROP TABLE IF EXISTS postcard_matrix CASCADE;")       # Ghost 2
-        conn.commit()
-        cur.close()
-        conn.close()
-        return "DATABASE RESET COMPLETE. Ready for sync."
-    except Exception as e:
-        return f"Error resetting DB: {str(e)}"
+        conn.commit(); cur.close(); conn.close()
+        return "DATABASE RESET COMPLETE."
+    except Exception as e: return f"Error: {str(e)}"
 
-# --- STEP 2: SYNC CATEGORIES ---
 @app.route('/sync-categories')
 def sync_categories():
     def generate():
-        yield "Starting Category Sync & Table Rebuild...\n"
-        
-        # 1. TEST CONNECTION & REBUILD
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
-            cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
-            cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
-            conn.commit()
-            yield "Tables Rebuilt Successfully (Connection Good).\n"
-        except Exception as e:
-            yield f"CRITICAL DB ERROR: {str(e)}\n"
-            return
-
-        # 2. SYNC
-        page = 0
-        limit = 50 
-        
-        try:
-            while True:
-                sig = generate_signature("GET")
-                params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": limit}
-                
-                yield f"Requesting Page {page}...\n"
-                resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
-                
-                if resp.status_code != 200:
-                    yield f"API ERROR {resp.status_code}: {resp.text}\n"
-                    break
-                
-                data = resp.json()
-                entities = data.get('entities', [])
-                
-                if not entities: break
-                
-                for cat in entities:
-                    cur.execute("""
-                        INSERT INTO product_categories (category_uuid, category_name) 
-                        VALUES (%s, %s) ON CONFLICT (category_uuid) DO NOTHING
-                    """, (cat['category_uuid'], cat['category_name']))
-                
-                conn.commit()
-                yield f"--> Saved {len(entities)} categories.\n"
-                
-                max_pages = int(data.get('maximumPages', 0))
-                if page >= (max_pages - 1): break
-                page += 1
-                time.sleep(0.1)
-
-        except Exception as e:
-            yield f"RUNTIME ERROR: {str(e)}\n"
-        finally:
-            cur.close(); conn.close()
-            yield "Category Sync Complete.\n"
-
-    return Response(stream_with_context(generate()), mimetype='text/plain')
-
-# --- STEP 3: SYNC POSTCARDS ---
-@app.route('/sync-postcards-full')
-def sync_postcards_full():
-    def generate():
-        yield "Starting Deep Postcard Sync...\n"
+        yield "Starting ONE-SHOT Category Sync (Limit 500)...\n"
         conn = get_db_connection()
         cur = conn.cursor()
         
-        yield "Searching for 'Postcards'...\n"
-        cur.execute("SELECT category_uuid FROM product_categories WHERE category_name ILIKE '%Postcards%' LIMIT 1;")
-        cat_row = cur.fetchone()
-        
-        if not cat_row:
-            yield "ERROR: Postcards not found. Run /sync-categories first.\n"
-            return
-        
-        cat_uuid = cat_row[0]
-        yield f"--> Found UUID: {cat_uuid}\n"
+        # 1. Ensure Tables Exist
+        cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
+        cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
+        cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
+        conn.commit()
 
-        products = []
-        page = 0
-        
+        # 2. THE STRAIGHT LINE CALL
         try:
-            while True:
-                sig = generate_signature("GET")
-                params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 50}
-                
-                resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_uuid}/products", params=params)
-                data = resp.json()
-                entities = data.get('entities', [])
-                
-                if not entities: break
-                products.extend(entities)
-                yield f"--> Found {len(entities)} products on Page {page}...\n"
-                
-                if page >= int(data.get('maximumPages', 0)) - 1: break
-                page += 1
-                time.sleep(0.1)
+            sig = generate_signature("GET")
+            # FORCE LIMIT 500 to get everything in one request
+            params = {"apikey": API_KEY, "signature": sig, "limit": 500}
+            
+            yield "Fetching data from 4over...\n"
+            resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
+            
+            if resp.status_code != 200:
+                yield f"API ERROR {resp.status_code}: {resp.text}\n"
+                return
 
-            yield f"Syncing Attributes for {len(products)} products...\n"
+            data = resp.json()
+            entities = data.get('entities', [])
+            yield f"--> RECEIVED {len(entities)} CATEGORIES total.\n"
+            
+            found_postcards = False
+            for cat in entities:
+                c_name = cat['category_name']
+                # Debug print for Postcards
+                if "Postcards" in c_name:
+                    yield f"*** FOUND IT: {c_name} ({cat['category_uuid']}) ***\n"
+                    found_postcards = True
+                
+                cur.execute("""
+                    INSERT INTO product_categories (category_uuid, category_name) 
+                    VALUES (%s, %s) ON CONFLICT (category_uuid) DO NOTHING
+                """, (cat['category_uuid'], c_name))
+            
+            conn.commit()
+            
+            if not found_postcards:
+                yield "WARNING: 'Postcards' keyword still not found. Check list in DBeaver.\n"
+            
+        except Exception as e:
+            yield f"ERROR: {str(e)}\n"
+        finally:
+            cur.close(); conn.close()
+            yield "Sync Complete.\n"
+
+    return Response(stream_with_context(generate()), mimetype='text/plain')
+
+@app.route('/sync-postcards-full')
+def sync_postcards_full():
+    def generate():
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        yield "Searching DB for 'Postcards'...\n"
+        cur.execute("SELECT category_name, category_uuid FROM product_categories WHERE category_name ILIKE '%Postcards%';")
+        rows = cur.fetchall()
+        
+        if not rows:
+            yield "ERROR: Still not found. Run Sync Categories first.\n"
+            return
+            
+        yield f"Found {len(rows)} matches:\n"
+        for r in rows:
+            yield f"--> {r[0]} | UUID: {r[1]}\n"
+            
+        # Pick the best match (Shortest name usually = 'Postcards')
+        # Sort by length of name to get "Postcards" before "Postcards - EDDM"
+        best_match = sorted(rows, key=lambda x: len(x[0]))[0]
+        cat_uuid = best_match[1]
+        cat_name = best_match[0]
+        yield f"Selected Category: {cat_name}\n"
+
+        # --- PRODUCT SYNC ---
+        yield "Fetching Products (Limit 500)...\n"
+        try:
+            sig = generate_signature("GET")
+            params = {"apikey": API_KEY, "signature": sig, "limit": 500}
+            resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_uuid}/products", params=params)
+            data = resp.json()
+            products = data.get('entities', [])
+            yield f"--> Found {len(products)} products.\n"
             
             for prod in products:
                 p_uuid, p_name = prod['product_uuid'], prod['product_name']
-                yield f"Processing: {p_name}...\n"
-                
                 cur.execute("INSERT INTO products (product_uuid, category_uuid, product_name) VALUES (%s, %s, %s) ON CONFLICT (product_uuid) DO NOTHING", (p_uuid, cat_uuid, p_name))
-                
-                opt_sig = generate_signature("GET")
-                opt_resp = requests.get(f"{BASE_URL}/printproducts/products/{p_uuid}/options", params={"apikey": API_KEY, "signature": opt_sig})
-                options = opt_resp.json().get('entities', [])
-                
-                for opt in options:
-                    cur.execute("""
-                        INSERT INTO product_attributes (product_uuid, attribute_type, attribute_uuid, attribute_name)
-                        VALUES (%s, %s, %s, %s) ON CONFLICT (product_uuid, attribute_uuid) DO NOTHING
-                    """, (p_uuid, opt['option_group_name'], opt['option_uuid'], opt['option_name']))
-                
-                conn.commit()
-                yield f"--> Saved options.\n"
-                time.sleep(0.1)
-
+            conn.commit()
+            yield "Products Saved.\n"
+            
         except Exception as e:
-            yield f"CRITICAL ERROR: {str(e)}\n"
-        finally:
-            cur.close(); conn.close()
-            yield "Postcard Sync Complete.\n"
+            yield f"Error fetching products: {str(e)}\n"
+            
+        yield "Job Done.\n"
 
     return Response(stream_with_context(generate()), mimetype='text/plain')
 

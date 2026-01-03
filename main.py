@@ -4,7 +4,6 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # --- AUTOMATIC DSN FIX ---
-# This resolves the 'psycopg2.ProgrammingError' by cleaning the Railway DB URL
 DB_URL = os.environ.get('DATABASE_URL', '').replace("postgresql+psycopg://", "postgresql://")
 API_KEY = os.environ.get('FOUR_OVER_APIKEY')
 PRIVATE_KEY = os.environ.get('FOUR_OVER_PRIVATE_KEY')
@@ -25,34 +24,37 @@ def init_db():
 
 @app.route('/sync-categories')
 def sync_categories():
-    """Master Sync: Recursively pulls every single category from 4over"""
+    """Master Sync: Forced recursion to pull HUNDREDS of categories"""
     init_db()
     all_cats = []
     page = 1
-    has_more = True
     
-    while has_more:
+    while True:
         sig = generate_signature("GET")
-        # We set limit to 100 to get the maximum allowed per page
+        # Forcing limit to 100 per page
         params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 100}
         
-        try:
-            resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
-            data = resp.json()
+        print(f"Fetching page {page} from 4over...")
+        resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
+        data = resp.json()
+        
+        entities = data.get('entities', [])
+        
+        # If no more entities are returned, we have reached the absolute end
+        if not entities:
+            print("No more categories found. Ending loop.")
+            break
             
-            entities = data.get('entities', [])
-            if not entities:
-                has_more = False
-            else:
-                all_cats.extend(entities)
-                # Check if we have reached the last page
-                total_pages = data.get('total_pages', 1)
-                if page >= total_pages:
-                    has_more = False
-                else:
-                    page += 1
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e), "last_page": page})
+        all_cats.extend(entities)
+        print(f"Pulled {len(entities)} categories from page {page}. Total so far: {len(all_cats)}")
+        
+        # Check if the API provides a way to know there are no more pages
+        # If not, we increment and try the next page until 'entities' is empty
+        page += 1
+        
+        # Safety break to prevent infinite loops (4over usually has ~150-200 categories)
+        if page > 50: 
+            break
 
     # Bulk Insert into Postgres
     conn = psycopg2.connect(DB_URL)
@@ -69,10 +71,7 @@ def sync_categories():
     return jsonify({
         "status": "success", 
         "total_categories": len(all_cats), 
-        "pages_processed": page
+        "pages_processed": page - 1
     })
 
-# Add your existing /sync-postcards-full route here...
-
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
+# /sync-postcards-full logic remains the same

@@ -31,11 +31,11 @@ def home():
         except: safe_url = "Error Parsing"
             
     return f"""
-    <h1>4over Connector (Docs Aligned)</h1>
-    <p><strong>DB:</strong> {safe_url}</p>
+    <h1>4over Connector: Blind Crawler</h1>
+    <p><strong>Target DB:</strong> {safe_url}</p>
     <hr>
     <p>1. <a href="/reset-db">Reset Database</a></p>
-    <p>2. <a href="/sync-categories">Sync Categories</a> (Loops all Pages)</p>
+    <p>2. <a href="/sync-categories">Sync Categories</a> (Blind Crawl)</p>
     <p>3. <a href="/sync-postcards-full">Sync Postcards</a></p>
     """
 
@@ -51,66 +51,76 @@ def reset_db():
         return "DATABASE RESET COMPLETE."
     except Exception as e: return f"Error: {str(e)}"
 
-# --- STEP 2: CATEGORY SYNC (UPDATED PER DOCS) ---
+# --- STEP 2: BLIND CRAWLER ---
 @app.route('/sync-categories')
 def sync_categories():
     def generate():
-        yield "Starting Category Sync (Pagination Mode)...\n"
+        yield "Starting BLIND CRAWLER Sync...\n"
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 1. Setup Tables
+        # 1. Tables
         cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
         cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
         cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
         conn.commit()
 
-        # 2. Get Page 1 to determine Max Pages
+        # 2. The Infinite Loop
         page = 1
-        max_pages = 1 # Default, will update from API
+        total_found = 0
         
-        while page <= max_pages:
+        while True: # Run forever until we break
             try:
                 sig = generate_signature("GET")
-                # Docs say limit is capped at 20, but we request 50 just in case
+                # Request 50 items. API might only give 20. We don't care.
                 params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 50}
                 
-                yield f"Requesting Page {page}...\n"
+                yield f"Crawling Page {page}..."
                 resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
+                
+                if resp.status_code != 200:
+                    yield f" [ERROR {resp.status_code}]\n"
+                    break
+                    
                 data = resp.json()
-                
-                # UPDATE MAX PAGES from the API response (The "Docs" logic)
-                if 'maximumPages' in data:
-                    max_pages = int(data['maximumPages'])
-                    # Safety Cap in case API goes crazy
-                    if max_pages > 50: max_pages = 50 
-                
                 entities = data.get('entities', [])
+                
+                # THE BREAK CONDITION: If entities is empty, we are done.
                 if not entities:
-                    yield "Page empty. Stopping.\n"
+                    yield " [EMPTY - DONE]\n"
                     break
                 
+                yield f" Found {len(entities)} items. Saving...\n"
+                
                 for cat in entities:
-                    if "Postcards" in cat['category_name']:
-                        yield f"*** FOUND POSTCARDS: {cat['category_name']} ***\n"
+                    c_name = cat['category_name']
+                    
+                    # Print interesting ones to log so we know it's working
+                    if "Postcards" in c_name:
+                        yield f"  >>> JACKPOT: Found {c_name} <<<\n"
                     
                     cur.execute("""
                         INSERT INTO product_categories (category_uuid, category_name) 
                         VALUES (%s, %s) ON CONFLICT (category_uuid) DO NOTHING
-                    """, (cat['category_uuid'], cat['category_name']))
+                    """, (cat['category_uuid'], c_name))
                 
                 conn.commit()
-                yield f"--> Saved {len(entities)} categories. (Max Pages: {max_pages})\n"
+                total_found += len(entities)
                 
+                # Safety Valve: Don't let it run forever if something goes wrong (limit 50 pages)
+                if page > 50:
+                    yield "Safety limit reached (50 pages). Stopping.\n"
+                    break
+                    
                 page += 1
-                time.sleep(0.2) # Respect rate limits
+                time.sleep(0.25) # Slight pause for API politeness
                 
             except Exception as e:
-                yield f"ERROR on Page {page}: {str(e)}\n"
+                yield f"CRITICAL ERROR: {str(e)}\n"
                 break
 
         cur.close(); conn.close()
-        yield "Category Sync Finished.\n"
+        yield f"Sync Finished. Total Categories: {total_found}\n"
 
     return Response(stream_with_context(generate()), mimetype='text/plain')
 
@@ -121,50 +131,47 @@ def sync_postcards_full():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 1. Find the UUID we just saved
         yield "Searching DB for 'Postcards'...\n"
         cur.execute("SELECT category_name, category_uuid FROM product_categories WHERE category_name ILIKE '%Postcards%';")
         rows = cur.fetchall()
         
         if not rows:
-            yield "ERROR: Postcards UUID not found in DB. Did the category sync finish?\n"
+            yield "ERROR: 'Postcards' NOT found in DB. Did Step 2 finish correctly?\n"
             return
             
-        # Sort to find the simplest name "Postcards" (Shortest string)
         best_match = sorted(rows, key=lambda x: len(x[0]))[0]
         cat_uuid = best_match[1]
-        yield f"Selected Category: {best_match[0]} ({cat_uuid})\n"
+        yield f"Using Category: {best_match[0]} ({cat_uuid})\n"
 
-        # 2. Fetch Products for this Category
-        # We also need to paginate this, as per the "Products Feed" docs you pasted
+        # Blind Crawl for Products too
         page = 1
-        max_pages = 1
         
-        while page <= max_pages:
+        while True:
             sig = generate_signature("GET")
             params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 50}
             
-            yield f"Fetching Products Page {page}...\n"
+            yield f"Fetching Products Page {page}..."
             resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_uuid}/products", params=params)
-            data = resp.json()
             
-            if 'maximumPages' in data:
-                max_pages = int(data['maximumPages'])
-                if max_pages > 20: max_pages = 20 # Safety cap
+            if resp.status_code != 200: break
                 
+            data = resp.json()
             products = data.get('entities', [])
-            if not products: break
+            
+            if not products: 
+                yield " [DONE]\n"
+                break
             
             for prod in products:
                 cur.execute("INSERT INTO products (product_uuid, category_uuid, product_name) VALUES (%s, %s, %s) ON CONFLICT (product_uuid) DO NOTHING", 
                             (prod['product_uuid'], cat_uuid, prod['product_name']))
             
             conn.commit()
-            yield f"--> Saved {len(products)} products.\n"
+            yield f" Saved {len(products)}.\n"
             page += 1
             time.sleep(0.2)
 
-        yield "Job Done.\n"
+        yield "Postcard Sync Complete.\n"
 
     return Response(stream_with_context(generate()), mimetype='text/plain')
 

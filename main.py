@@ -3,14 +3,11 @@ from flask import Flask, Response, stream_with_context
 
 app = Flask(__name__)
 
-# --- PRODUCTION CONFIG ---
-# 1. Database: Fixes Railway's DSN error automatically
+# --- CONFIG ---
+# Fixes Railway's "invalid dsn" error automatically
 DB_URL = os.environ.get('DATABASE_URL', '').replace("postgresql+psycopg://", "postgresql://")
-
-# 2. 4over API: LIVE ENDPOINT (No more sandbox)
+# LIVE Production URL
 BASE_URL = os.environ.get('FOUR_OVER_BASE_URL', 'https://api.4over.com') 
-
-# 3. Credentials: pulling from env vars
 API_KEY = os.environ.get('FOUR_OVER_APIKEY')
 PRIVATE_KEY = os.environ.get('FOUR_OVER_PRIVATE_KEY')
 
@@ -21,36 +18,48 @@ def generate_signature(method):
 def get_db_connection():
     return psycopg2.connect(DB_URL)
 
-def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    # Ensure tables exist for the live data
-    cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
-    cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
-    cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
-    conn.commit()
-    cur.close()
-    conn.close()
-
 @app.route('/')
 def home():
-    return "PRODUCTION Connector Online. /sync-categories for live data."
+    return "Connector Online. 1. Run /reset-db, 2. Run /sync-categories."
 
+# --- STEP 1: THE NUCLEAR RESET ---
+@app.route('/reset-db')
+def reset_db():
+    """Drops all tables so they can be recreated with the correct UUID schema."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Drop in correct order to avoid ForeignKey violations
+        cur.execute("DROP TABLE IF EXISTS product_attributes;")
+        cur.execute("DROP TABLE IF EXISTS products;")
+        cur.execute("DROP TABLE IF EXISTS product_categories;")
+        conn.commit()
+        cur.close()
+        conn.close()
+        return "DATABASE RESET COMPLETE. Old tables are gone. You can now run /sync-categories."
+    except Exception as e:
+        return f"Error resetting DB: {str(e)}"
+
+# --- STEP 2: SYNC CATEGORIES ---
 @app.route('/sync-categories')
 def sync_categories():
     def generate():
-        yield "Starting LIVE Category Sync...\n"
+        yield "Starting Category Sync & Table Rebuild...\n"
         
+        # 1. REBUILD TABLES (With Correct UUID Schema)
         try:
-            init_db()
-            yield "Database Tables Ready.\n"
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
+            cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
+            cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
+            conn.commit()
+            yield "Tables Rebuilt Successfully.\n"
         except Exception as e:
             yield f"CRITICAL DB ERROR: {str(e)}\n"
             return
 
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
+        # 2. SYNC FROM 4OVER
         page = 0
         limit = 50 
         
@@ -59,49 +68,116 @@ def sync_categories():
                 sig = generate_signature("GET")
                 params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": limit}
                 
-                yield f"Requesting Page {page} from {BASE_URL}...\n"
-                
+                yield f"Requesting Page {page}...\n"
                 resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
                 
                 if resp.status_code != 200:
                     yield f"API ERROR {resp.status_code}: {resp.text}\n"
-                    # If 401, it means your Keys are still Sandbox keys!
                     break
                 
                 data = resp.json()
                 entities = data.get('entities', [])
                 
                 if not entities:
-                    yield "No more entities. Stopping.\n"
                     break
                 
-                # Save Data Immediately
-                count = 0
                 for cat in entities:
                     cur.execute("""
                         INSERT INTO product_categories (category_uuid, category_name) 
                         VALUES (%s, %s) ON CONFLICT (category_uuid) DO NOTHING
                     """, (cat['category_uuid'], cat['category_name']))
-                    count += 1
                 
                 conn.commit()
-                yield f"--> Saved {count} categories from Page {page}.\n"
+                yield f"--> Saved {len(entities)} categories.\n"
                 
-                # Pagination Check
                 max_pages = int(data.get('maximumPages', 0))
                 if page >= (max_pages - 1):
-                    yield "Reached last page. Sync Complete.\n"
                     break
-                
                 page += 1
-                time.sleep(0.1) # Respect Production Rate Limits
+                time.sleep(0.1)
 
         except Exception as e:
             yield f"RUNTIME ERROR: {str(e)}\n"
         finally:
-            cur.close()
-            conn.close()
-            yield "Connection Closed.\n"
+            cur.close(); conn.close()
+            yield "Category Sync Complete.\n"
+
+    return Response(stream_with_context(generate()), mimetype='text/plain')
+
+# --- STEP 3: SYNC POSTCARDS ---
+@app.route('/sync-postcards-full')
+def sync_postcards_full():
+    def generate():
+        yield "Starting Deep Postcard Sync...\n"
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # 1. FIND CATEGORY
+        yield "Searching for 'Postcards'...\n"
+        cur.execute("SELECT category_uuid FROM product_categories WHERE category_name ILIKE '%Postcards%' LIMIT 1;")
+        cat_row = cur.fetchone()
+        
+        if not cat_row:
+            yield "ERROR: Postcards not found. Did you run /sync-categories?\n"
+            return
+        
+        cat_uuid = cat_row[0]
+        yield f"--> Found UUID: {cat_uuid}\n"
+
+        # 2. FIND PRODUCTS
+        products = []
+        page = 0
+        limit = 50
+        
+        try:
+            while True:
+                sig = generate_signature("GET")
+                params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": limit}
+                
+                resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_uuid}/products", params=params)
+                data = resp.json()
+                entities = data.get('entities', [])
+                
+                if not entities: break
+                products.extend(entities)
+                yield f"--> Found {len(entities)} products on Page {page}...\n"
+                
+                max_pages = int(data.get('maximumPages', 0))
+                if page >= (max_pages - 1): break
+                page += 1
+                time.sleep(0.1)
+
+            # 3. DEEP DIVE (Attributes)
+            yield f"Starting Attribute Sync for {len(products)} products...\n"
+            
+            for prod in products:
+                p_uuid, p_name = prod['product_uuid'], prod['product_name']
+                yield f"Processing: {p_name}...\n"
+                
+                # Save Product First (Required for Foreign Key)
+                cur.execute("INSERT INTO products (product_uuid, category_uuid, product_name) VALUES (%s, %s, %s) ON CONFLICT (product_uuid) DO NOTHING", (p_uuid, cat_uuid, p_name))
+                
+                # Fetch Options
+                opt_sig = generate_signature("GET")
+                opt_resp = requests.get(f"{BASE_URL}/printproducts/products/{p_uuid}/options", params={"apikey": API_KEY, "signature": opt_sig})
+                options = opt_resp.json().get('entities', [])
+                
+                # Save Options
+                for opt in options:
+                    cur.execute("""
+                        INSERT INTO product_attributes (product_uuid, attribute_type, attribute_uuid, attribute_name)
+                        VALUES (%s, %s, %s, %s) ON CONFLICT (product_uuid, attribute_uuid) DO NOTHING
+                    """, (p_uuid, opt['option_group_name'], opt['option_uuid'], opt['option_name']))
+                
+                conn.commit()
+                yield f"--> Saved options for {p_name}.\n"
+                time.sleep(0.1)
+
+        except Exception as e:
+            yield f"CRITICAL ERROR: {str(e)}\n"
+        finally:
+            cur.close(); conn.close()
+            yield "Postcard Sync Complete.\n"
 
     return Response(stream_with_context(generate()), mimetype='text/plain')
 

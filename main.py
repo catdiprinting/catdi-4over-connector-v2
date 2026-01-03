@@ -1,20 +1,16 @@
-import os
-import hashlib
-import hmac
-import requests
-import psycopg2
-from flask import Flask, jsonify, render_template_string
+import os, hashlib, hmac, requests, psycopg2
+from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
+# --- CONFIG & DSN FIX ---
 DB_URL = os.environ.get('DATABASE_URL', '').replace("postgresql+psycopg://", "postgresql://")
 API_KEY = os.environ.get('FOUR_OVER_APIKEY')
 PRIVATE_KEY = os.environ.get('FOUR_OVER_PRIVATE_KEY')
 BASE_URL = os.environ.get('FOUR_OVER_BASE_URL', 'https://sandbox-api.4over.com')
 
-# Global variable to store progress for the counter
-sync_progress = {"current": 0, "total": 0, "status": "Ready", "last_item": ""}
+# Tracking for your progress counter
+sync_stats = {"current": 0, "total": 0, "status": "Ready"}
 
 def generate_signature(method):
     private_hash = hashlib.sha256(PRIVATE_KEY.encode('utf-8')).hexdigest()
@@ -23,64 +19,45 @@ def generate_signature(method):
 def init_db():
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS api_logs (id SERIAL PRIMARY KEY, endpoint TEXT, method TEXT, response_code INTEGER, response_body TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
-    cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT, last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
-    cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT, last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
+    # Core tables with UUID constraints to prevent duplicates
+    cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
+    cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
     cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
     conn.commit()
     cur.close()
     conn.close()
 
-@app.route('/progress')
-def get_progress():
-    """Returns the current sync percentage for the counter"""
-    if sync_progress["total"] > 0:
-        percent = int((sync_progress["current"] / sync_progress["total"]) * 100)
-    else:
-        percent = 0
-    return jsonify({
-        "percent": percent,
-        "status": sync_progress["status"],
-        "item": sync_progress["last_item"]
-    })
-
-@app.route('/sync-postcards-deep')
-def sync_postcards_deep():
-    global sync_progress
+@app.route('/sync-postcards-full')
+def sync_postcards_full():
+    global sync_stats
     init_db()
     
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
     
-    # 1. Get Postcard Category
+    # 1. Find Postcard Category
     cur.execute("SELECT category_uuid FROM product_categories WHERE category_name ILIKE '%Postcards%' LIMIT 1;")
     cat_res = cur.fetchone()
-    if not cat_res: return "Error: Sync categories first!", 400
+    if not cat_res: return "Error: Please sync categories first.", 400
     cat_uuid = cat_res[0]
 
-    # 2. Get All Postcard Products
+    # 2. Fetch all Postcard Product Types (14pt, 16pt, etc)
     sig = generate_signature("GET")
-    params = {"apikey": API_KEY, "signature": sig}
-    resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_uuid}/products", params=params)
+    resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_uuid}/products", params={"apikey": API_KEY, "signature": sig})
     products = resp.json().get('entities', [])
     
-    sync_progress["total"] = len(products)
-    sync_progress["current"] = 0
-    sync_progress["status"] = "Syncing Postcards..."
+    sync_stats["total"] = len(products)
+    sync_stats["current"] = 0
 
-    # 3. Deep Sync Loop
     for prod in products:
         p_uuid = prod['product_uuid']
-        p_name = prod['product_name']
-        sync_progress["last_item"] = p_name
+        # Save Base Product
+        cur.execute("INSERT INTO products (product_uuid, category_uuid, product_name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (p_uuid, cat_uuid, prod['product_name']))
         
-        # Save Product
-        cur.execute("INSERT INTO products (product_uuid, category_uuid, product_name) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (p_uuid, cat_uuid, p_name))
-        
-        # Get Options (Sizes, Stocks, Colors)
+        # 3. THE DEEP QUANTITY PULL (Sizes, Stocks, Colors, Runsizes)
+        # This is where we grab the 'millions of combinations'
         opt_sig = generate_signature("GET")
-        opt_params = {"apikey": API_KEY, "signature": opt_sig}
-        opt_resp = requests.get(f"{BASE_URL}/printproducts/products/{p_uuid}/options", params=opt_params)
+        opt_resp = requests.get(f"{BASE_URL}/printproducts/products/{p_uuid}/options", params={"apikey": API_KEY, "signature": opt_sig})
         options = opt_resp.json().get('entities', [])
         
         for opt in options:
@@ -89,13 +66,12 @@ def sync_postcards_deep():
                 VALUES (%s, %s, %s, %s) ON CONFLICT (product_uuid, attribute_uuid) DO NOTHING
             """, (p_uuid, opt['option_group_name'], opt['option_uuid'], opt['option_name']))
         
-        sync_progress["current"] += 1
+        sync_stats["current"] += 1
         conn.commit()
 
-    sync_progress["status"] = "Complete"
     cur.close()
     conn.close()
-    return jsonify({"status": "success", "synced": len(products)})
+    return jsonify({"status": "success", "message": f"Synced {len(products)} products and all quantities/options."})
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))

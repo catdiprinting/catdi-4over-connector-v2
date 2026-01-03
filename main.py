@@ -4,9 +4,7 @@ from flask import Flask, Response, stream_with_context
 app = Flask(__name__)
 
 # --- CONFIG ---
-# Fixes Railway's "invalid dsn" error automatically
 DB_URL = os.environ.get('DATABASE_URL', '').replace("postgresql+psycopg://", "postgresql://")
-# LIVE Production URL
 BASE_URL = os.environ.get('FOUR_OVER_BASE_URL', 'https://api.4over.com') 
 API_KEY = os.environ.get('FOUR_OVER_APIKEY')
 PRIVATE_KEY = os.environ.get('FOUR_OVER_PRIVATE_KEY')
@@ -22,21 +20,27 @@ def get_db_connection():
 def home():
     return "Connector Online. 1. Run /reset-db, 2. Run /sync-categories."
 
-# --- STEP 1: THE NUCLEAR RESET ---
+# --- STEP 1: SUPER NUCLEAR RESET ---
 @app.route('/reset-db')
 def reset_db():
-    """Drops all tables so they can be recreated with the correct UUID schema."""
+    """Drops tables with CASCADE to force-delete hidden dependencies."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Drop in correct order to avoid ForeignKey violations
-        cur.execute("DROP TABLE IF EXISTS product_attributes;")
-        cur.execute("DROP TABLE IF EXISTS products;")
-        cur.execute("DROP TABLE IF EXISTS product_categories;")
+        
+        # CASCADE is the key: It deletes the table AND anything linked to it
+        cur.execute("DROP TABLE IF EXISTS product_attributes CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS products CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS product_categories CASCADE;")
+        
+        # Just in case, explicitly drop the ghost tables found in your logs
+        cur.execute("DROP TABLE IF EXISTS product_configurations CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS postcard_matrix CASCADE;")
+        
         conn.commit()
         cur.close()
         conn.close()
-        return "DATABASE RESET COMPLETE. Old tables are gone. You can now run /sync-categories."
+        return "DATABASE RESET COMPLETE. All tables (including ghosts) are gone. Run /sync-categories."
     except Exception as e:
         return f"Error resetting DB: {str(e)}"
 
@@ -46,10 +50,10 @@ def sync_categories():
     def generate():
         yield "Starting Category Sync & Table Rebuild...\n"
         
-        # 1. REBUILD TABLES (With Correct UUID Schema)
         try:
             conn = get_db_connection()
             cur = conn.cursor()
+            # Recreate with correct UUID schema
             cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
             cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
             cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
@@ -59,7 +63,6 @@ def sync_categories():
             yield f"CRITICAL DB ERROR: {str(e)}\n"
             return
 
-        # 2. SYNC FROM 4OVER
         page = 0
         limit = 50 
         
@@ -78,8 +81,7 @@ def sync_categories():
                 data = resp.json()
                 entities = data.get('entities', [])
                 
-                if not entities:
-                    break
+                if not entities: break
                 
                 for cat in entities:
                     cur.execute("""
@@ -91,8 +93,7 @@ def sync_categories():
                 yield f"--> Saved {len(entities)} categories.\n"
                 
                 max_pages = int(data.get('maximumPages', 0))
-                if page >= (max_pages - 1):
-                    break
+                if page >= (max_pages - 1): break
                 page += 1
                 time.sleep(0.1)
 
@@ -112,7 +113,6 @@ def sync_postcards_full():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 1. FIND CATEGORY
         yield "Searching for 'Postcards'...\n"
         cur.execute("SELECT category_uuid FROM product_categories WHERE category_name ILIKE '%Postcards%' LIMIT 1;")
         cat_row = cur.fetchone()
@@ -124,7 +124,6 @@ def sync_postcards_full():
         cat_uuid = cat_row[0]
         yield f"--> Found UUID: {cat_uuid}\n"
 
-        # 2. FIND PRODUCTS
         products = []
         page = 0
         limit = 50
@@ -147,22 +146,18 @@ def sync_postcards_full():
                 page += 1
                 time.sleep(0.1)
 
-            # 3. DEEP DIVE (Attributes)
             yield f"Starting Attribute Sync for {len(products)} products...\n"
             
             for prod in products:
                 p_uuid, p_name = prod['product_uuid'], prod['product_name']
                 yield f"Processing: {p_name}...\n"
                 
-                # Save Product First (Required for Foreign Key)
                 cur.execute("INSERT INTO products (product_uuid, category_uuid, product_name) VALUES (%s, %s, %s) ON CONFLICT (product_uuid) DO NOTHING", (p_uuid, cat_uuid, p_name))
                 
-                # Fetch Options
                 opt_sig = generate_signature("GET")
                 opt_resp = requests.get(f"{BASE_URL}/printproducts/products/{p_uuid}/options", params={"apikey": API_KEY, "signature": opt_sig})
                 options = opt_resp.json().get('entities', [])
                 
-                # Save Options
                 for opt in options:
                     cur.execute("""
                         INSERT INTO product_attributes (product_uuid, attribute_type, attribute_uuid, attribute_name)
@@ -170,7 +165,7 @@ def sync_postcards_full():
                     """, (p_uuid, opt['option_group_name'], opt['option_uuid'], opt['option_name']))
                 
                 conn.commit()
-                yield f"--> Saved options for {p_name}.\n"
+                yield f"--> Saved options.\n"
                 time.sleep(0.1)
 
         except Exception as e:

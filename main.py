@@ -4,22 +4,19 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # --- AUTOMATIC DSN & URL FIX ---
-# Cleans the '+psycopg' from Railway's DATABASE_URL to prevent 500 errors
 DB_URL = os.environ.get('DATABASE_URL', '').replace("postgresql+psycopg://", "postgresql://")
 API_KEY = os.environ.get('FOUR_OVER_APIKEY')
 PRIVATE_KEY = os.environ.get('FOUR_OVER_PRIVATE_KEY')
 BASE_URL = os.environ.get('FOUR_OVER_BASE_URL', 'https://sandbox-api.4over.com')
 
-# Progress tracking for your counter
+# Tracking for your progress counter
 sync_stats = {"current": 0, "total": 0, "status": "Ready", "last_item": ""}
 
 def generate_signature(method):
-    """Creates the HMAC-SHA256 signature required by 4over"""
     private_hash = hashlib.sha256(PRIVATE_KEY.encode('utf-8')).hexdigest()
     return hmac.new(private_hash.encode('utf-8'), method.upper().encode('utf-8'), hashlib.sha256).hexdigest()
 
 def init_db():
-    """Self-healing: Creates the world-class matrix tables if they are missing"""
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
@@ -28,43 +25,54 @@ def init_db():
     conn.commit()
     cur.close(); conn.close()
 
-@app.route('/')
-def home():
-    return jsonify({"status": "online", "message": "Catdi Connector Active"})
-
-@app.route('/progress')
-def get_progress():
-    """Returns the current sync percentage"""
-    percent = int((sync_stats["current"] / sync_stats["total"]) * 100) if sync_stats["total"] > 0 else 0
-    return jsonify({"percent": percent, "status": sync_stats["status"], "item": sync_stats["last_item"]})
-
 @app.route('/sync-categories')
 def sync_categories():
-    """Foundation: Pulls the initial list of print categories"""
+    """Recursive Sync: Fetches ALL pages of categories from 4over"""
     init_db()
-    sig = generate_signature("GET")
-    resp = requests.get(f"{BASE_URL}/printproducts/categories", params={"apikey": API_KEY, "signature": sig})
-    categories = resp.json().get('entities', [])
-    
+    all_categories = []
+    page = 1
+    has_more = True
+
+    while has_more:
+        sig = generate_signature("GET")
+        # 4over pagination uses 'page' and 'limit' parameters
+        params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 100}
+        resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
+        data = resp.json()
+        
+        categories = data.get('entities', [])
+        all_categories.extend(categories)
+        
+        # Check if we should keep going
+        # 4over usually provides a 'total_pages' or similar in the metadata
+        total_pages = data.get('total_pages', 1)
+        if page >= total_pages or not categories:
+            has_more = False
+        else:
+            page += 1
+
+    # Save all categories to the DB
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
-    for cat in categories:
+    for cat in all_categories:
         cur.execute("INSERT INTO product_categories (category_uuid, category_name) VALUES (%s, %s) ON CONFLICT DO NOTHING", (cat['category_uuid'], cat['category_name']))
     conn.commit()
     cur.close(); conn.close()
-    return jsonify({"status": "success", "synced": len(categories)})
+    
+    return jsonify({"status": "success", "total_categories": len(all_categories)})
 
 @app.route('/sync-postcards-full')
 def sync_postcards_full():
-    """The Crawler: Pulls all sizes, stocks, and quantities for all Postcards"""
+    """The Master Crawler: Pulls ALL Postcards and their variations"""
     global sync_stats
     init_db()
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
     
+    # 1. Identify Postcard Category from the full list
     cur.execute("SELECT category_uuid FROM product_categories WHERE category_name ILIKE '%Postcards%' LIMIT 1;")
     cat_row = cur.fetchone()
-    if not cat_row: return "Error: Run /sync-categories first!", 400
+    if not cat_row: return jsonify({"error": "Sync all categories first!"}), 400
 
     sig = generate_signature("GET")
     resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_row[0]}/products", params={"apikey": API_KEY, "signature": sig})
@@ -72,7 +80,7 @@ def sync_postcards_full():
     
     sync_stats["total"] = len(products)
     sync_stats["current"] = 0
-    sync_stats["status"] = "Syncing Postcard Matrix..."
+    sync_stats["status"] = "Running"
 
     for prod in products:
         p_uuid = prod['product_uuid']

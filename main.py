@@ -4,7 +4,13 @@ from flask import Flask, Response, stream_with_context
 app = Flask(__name__)
 
 # --- CONFIG ---
-DB_URL = os.environ.get('DATABASE_URL', '').replace("postgresql+psycopg://", "postgresql://")
+# Automatically fix Railway's "postgres://" vs "postgresql://" quirk
+raw_db_url = os.environ.get('DATABASE_URL', '')
+if raw_db_url.startswith("postgres://"):
+    DB_URL = raw_db_url.replace("postgres://", "postgresql://", 1)
+else:
+    DB_URL = raw_db_url
+
 BASE_URL = os.environ.get('FOUR_OVER_BASE_URL', 'https://api.4over.com') 
 API_KEY = os.environ.get('FOUR_OVER_APIKEY')
 PRIVATE_KEY = os.environ.get('FOUR_OVER_PRIVATE_KEY')
@@ -18,29 +24,45 @@ def get_db_connection():
 
 @app.route('/')
 def home():
-    return "Connector Online. 1. Run /reset-db, 2. Run /sync-categories."
+    # --- DEBUG SECTION ---
+    # This safely shows us what the app sees, without revealing the password
+    safe_url = "Not Set"
+    if DB_URL:
+        try:
+            # parsing to hide password
+            parts = DB_URL.split("@")
+            if len(parts) > 1:
+                safe_url = f"...@{parts[1]}" # Shows only host:port/db
+            else:
+                safe_url = "Invalid Format"
+        except:
+            safe_url = "Error Parsing"
+            
+    return f"""
+    <h1>Connector Status: Online</h1>
+    <p><strong>Target Database:</strong> {safe_url}</p>
+    <p><strong>Target API:</strong> {BASE_URL}</p>
+    <hr>
+    <p>1. <a href="/reset-db">Reset Database</a> (Wipes tables)</p>
+    <p>2. <a href="/sync-categories">Sync Categories</a> (Rebuilds tables)</p>
+    <p>3. <a href="/sync-postcards-full">Sync Postcards</a> (Deep dive)</p>
+    """
 
-# --- STEP 1: SUPER NUCLEAR RESET ---
+# --- STEP 1: RESET DB ---
 @app.route('/reset-db')
 def reset_db():
-    """Drops tables with CASCADE to force-delete hidden dependencies."""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
-        # CASCADE is the key: It deletes the table AND anything linked to it
         cur.execute("DROP TABLE IF EXISTS product_attributes CASCADE;")
         cur.execute("DROP TABLE IF EXISTS products CASCADE;")
         cur.execute("DROP TABLE IF EXISTS product_categories CASCADE;")
-        
-        # Just in case, explicitly drop the ghost tables found in your logs
-        cur.execute("DROP TABLE IF EXISTS product_configurations CASCADE;")
-        cur.execute("DROP TABLE IF EXISTS postcard_matrix CASCADE;")
-        
+        cur.execute("DROP TABLE IF EXISTS product_configurations CASCADE;") # Ghost 1
+        cur.execute("DROP TABLE IF EXISTS postcard_matrix CASCADE;")       # Ghost 2
         conn.commit()
         cur.close()
         conn.close()
-        return "DATABASE RESET COMPLETE. All tables (including ghosts) are gone. Run /sync-categories."
+        return "DATABASE RESET COMPLETE. Ready for sync."
     except Exception as e:
         return f"Error resetting DB: {str(e)}"
 
@@ -50,19 +72,20 @@ def sync_categories():
     def generate():
         yield "Starting Category Sync & Table Rebuild...\n"
         
+        # 1. TEST CONNECTION & REBUILD
         try:
             conn = get_db_connection()
             cur = conn.cursor()
-            # Recreate with correct UUID schema
             cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
             cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
             cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
             conn.commit()
-            yield "Tables Rebuilt Successfully.\n"
+            yield "Tables Rebuilt Successfully (Connection Good).\n"
         except Exception as e:
             yield f"CRITICAL DB ERROR: {str(e)}\n"
             return
 
+        # 2. SYNC
         page = 0
         limit = 50 
         
@@ -118,7 +141,7 @@ def sync_postcards_full():
         cat_row = cur.fetchone()
         
         if not cat_row:
-            yield "ERROR: Postcards not found. Did you run /sync-categories?\n"
+            yield "ERROR: Postcards not found. Run /sync-categories first.\n"
             return
         
         cat_uuid = cat_row[0]
@@ -126,12 +149,11 @@ def sync_postcards_full():
 
         products = []
         page = 0
-        limit = 50
         
         try:
             while True:
                 sig = generate_signature("GET")
-                params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": limit}
+                params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": 50}
                 
                 resp = requests.get(f"{BASE_URL}/printproducts/categories/{cat_uuid}/products", params=params)
                 data = resp.json()
@@ -141,12 +163,11 @@ def sync_postcards_full():
                 products.extend(entities)
                 yield f"--> Found {len(entities)} products on Page {page}...\n"
                 
-                max_pages = int(data.get('maximumPages', 0))
-                if page >= (max_pages - 1): break
+                if page >= int(data.get('maximumPages', 0)) - 1: break
                 page += 1
                 time.sleep(0.1)
 
-            yield f"Starting Attribute Sync for {len(products)} products...\n"
+            yield f"Syncing Attributes for {len(products)} products...\n"
             
             for prod in products:
                 p_uuid, p_name = prod['product_uuid'], prod['product_name']

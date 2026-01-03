@@ -3,11 +3,16 @@ from flask import Flask, Response, stream_with_context
 
 app = Flask(__name__)
 
-# --- CONFIG ---
+# --- PRODUCTION CONFIG ---
+# 1. Database: Fixes Railway's DSN error automatically
 DB_URL = os.environ.get('DATABASE_URL', '').replace("postgresql+psycopg://", "postgresql://")
+
+# 2. 4over API: LIVE ENDPOINT (No more sandbox)
+BASE_URL = os.environ.get('FOUR_OVER_BASE_URL', 'https://api.4over.com') 
+
+# 3. Credentials: pulling from env vars
 API_KEY = os.environ.get('FOUR_OVER_APIKEY')
 PRIVATE_KEY = os.environ.get('FOUR_OVER_PRIVATE_KEY')
-BASE_URL = os.environ.get('FOUR_OVER_BASE_URL', 'https://sandbox-api.4over.com')
 
 def generate_signature(method):
     private_hash = hashlib.sha256(PRIVATE_KEY.encode('utf-8')).hexdigest()
@@ -19,6 +24,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    # Ensure tables exist for the live data
     cur.execute("CREATE TABLE IF NOT EXISTS product_categories (category_uuid UUID PRIMARY KEY, category_name TEXT);")
     cur.execute("CREATE TABLE IF NOT EXISTS products (product_uuid UUID PRIMARY KEY, category_uuid UUID REFERENCES product_categories(category_uuid), product_name TEXT);")
     cur.execute("CREATE TABLE IF NOT EXISTS product_attributes (id SERIAL PRIMARY KEY, product_uuid UUID REFERENCES products(product_uuid), attribute_type TEXT, attribute_uuid UUID, attribute_name TEXT, UNIQUE(product_uuid, attribute_uuid));")
@@ -28,16 +34,16 @@ def init_db():
 
 @app.route('/')
 def home():
-    return "Streamer Online. Use /sync-categories to see real-time output."
+    return "PRODUCTION Connector Online. /sync-categories for live data."
 
 @app.route('/sync-categories')
 def sync_categories():
     def generate():
-        yield "Starting Category Sync...\n"
+        yield "Starting LIVE Category Sync...\n"
         
         try:
             init_db()
-            yield "Database Tables Checked/Created.\n"
+            yield "Database Tables Ready.\n"
         except Exception as e:
             yield f"CRITICAL DB ERROR: {str(e)}\n"
             return
@@ -45,7 +51,6 @@ def sync_categories():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 4over starts at page 0 based on your PDF
         page = 0
         limit = 50 
         
@@ -54,23 +59,23 @@ def sync_categories():
                 sig = generate_signature("GET")
                 params = {"apikey": API_KEY, "signature": sig, "page": page, "limit": limit}
                 
-                url = f"{BASE_URL}/printproducts/categories"
-                yield f"Requesting Page {page} from {url}...\n"
+                yield f"Requesting Page {page} from {BASE_URL}...\n"
                 
-                resp = requests.get(url, params=params)
+                resp = requests.get(f"{BASE_URL}/printproducts/categories", params=params)
                 
                 if resp.status_code != 200:
                     yield f"API ERROR {resp.status_code}: {resp.text}\n"
+                    # If 401, it means your Keys are still Sandbox keys!
                     break
                 
                 data = resp.json()
                 entities = data.get('entities', [])
                 
                 if not entities:
-                    yield "No entities found on this page. Stopping.\n"
+                    yield "No more entities. Stopping.\n"
                     break
                 
-                # Save Data
+                # Save Data Immediately
                 count = 0
                 for cat in entities:
                     cur.execute("""
@@ -80,19 +85,16 @@ def sync_categories():
                     count += 1
                 
                 conn.commit()
-                yield f"--> Successfully saved {count} categories from Page {page}.\n"
+                yield f"--> Saved {count} categories from Page {page}.\n"
                 
-                # Pagination Logic from PDF
-                # PDF says "maximumPages" is the total page count
+                # Pagination Check
                 max_pages = int(data.get('maximumPages', 0))
-                
-                # If current page (0-indexed) reaches max_pages - 1, we are done
                 if page >= (max_pages - 1):
                     yield "Reached last page. Sync Complete.\n"
                     break
                 
                 page += 1
-                time.sleep(0.1) # Be nice to the API
+                time.sleep(0.1) # Respect Production Rate Limits
 
         except Exception as e:
             yield f"RUNTIME ERROR: {str(e)}\n"

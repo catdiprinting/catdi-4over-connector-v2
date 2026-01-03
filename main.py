@@ -2,46 +2,66 @@ import os
 import hashlib
 import hmac
 import requests
+import psycopg2
 from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# Fetch variables from your Railway Environment
+# Credentials from Railway Variables
+DB_URL = os.environ.get('DATABASE_URL')
 API_KEY = os.environ.get('FOUR_OVER_APIKEY')
 PRIVATE_KEY = os.environ.get('FOUR_OVER_PRIVATE_KEY')
-BASE_URL = os.environ.get('FOUR_OVER_BASE_URL')
+BASE_URL = os.environ.get('FOUR_OVER_BASE_URL', 'https://sandbox-api.4over.com')
 
 def generate_signature(method):
-    """Formula: hmac_sha256(METHOD, sha256(PrivateKey))"""
+    """Creates the HMAC-SHA256 signature 4over requires"""
     private_hash = hashlib.sha256(PRIVATE_KEY.encode('utf-8')).hexdigest()
-    signature = hmac.new(
-        private_hash.encode('utf-8'),
-        method.upper().encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    return signature
+    return hmac.new(private_hash.encode('utf-8'), method.upper().encode('utf-8'), hashlib.sha256).hexdigest()
 
-@app.route('/')
-def home():
-    return "✅ 4over Connector Service is Online"
-
-@app.route('/test-connection')
-def test_connection():
-    """Allows you to verify the connection via your browser"""
+@app.route('/sync-categories')
+def sync_categories():
     method = "GET"
     signature = generate_signature(method)
-    endpoint = f"{BASE_URL}/loginproviders"
+    endpoint = "/printproducts/categories"
+    
+    # 1. Fetch from 4over
     params = {"apikey": API_KEY, "signature": signature}
+    response = requests.get(f"{BASE_URL}{endpoint}", params=params)
     
-    response = requests.get(endpoint, params=params)
-    if response.status_code == 200:
-        return jsonify({"status": "Success", "data": response.json()})
-    else:
-        return jsonify({"status": "Failed", "error": response.text}), 401
+    if response.status_code != 200:
+        return jsonify({"status": "error", "message": response.text}), response.status_code
+
+    categories = response.json().get('entities', [])
+    
+    # 2. Connect to Railway Postgres
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor()
+    
+    # 3. Log the interaction (Audit Trail)
+    cur.execute(
+        "INSERT INTO api_logs (endpoint, method, response_code, response_body) VALUES (%s, %s, %s, %s)",
+        (endpoint, method, response.status_code, "Fetched " + str(len(categories)) + " categories")
+    )
+
+    # 4. Save categories to DB
+    for cat in categories:
+        cur.execute("""
+            INSERT INTO product_categories (category_uuid, category_name)
+            VALUES (%s, %s)
+            ON CONFLICT (category_uuid) DO UPDATE 
+            SET category_name = EXCLUDED.category_name, last_updated = CURRENT_TIMESTAMP;
+        """, (cat['category_uuid'], cat['category_name']))
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    return jsonify({
+        "status": "success",
+        "synced_count": len(categories),
+        "sample": categories[:2]
+    })
+
 if __name__ == "__main__":
-    # Railway provides the PORT environment variable automatically. 
-    # Do NOT set this to a hardcoded number like 8000.
-    port = int(os.environ.get("PORT", 8080)) 
-    
-    # You MUST use host='0.0.0.0' for Railway to route traffic to your app
+    port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
